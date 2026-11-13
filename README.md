@@ -1,7 +1,8 @@
 # Spectrogram
 
-A real-time 3D RF spectrogram (waterfall) for the Nuand bladeRF, written in C++20
-and rendered with Vulkan. It streams IQ samples at 20 MS/s, runs an FFT over
+A real-time 3D RF spectrogram (waterfall) for the Nuand bladeRF and for RTL-SDR
+dongles, written in C++20 and rendered with Vulkan. It streams IQ samples at
+20 MS/s from a bladeRF (2.4 MS/s from an RTL-SDR), runs an FFT over
 every one of them, and draws the result as a scrolling height field you can fly
 around — or flatten into a classic 2D waterfall or spectrum-analyser view.
 
@@ -27,6 +28,8 @@ in the 3D view with the control panel, as a 2D waterfall, and as a spectrum.
 - **3D, 2D and spectrum views** of the same data, with frequency, level and
   time axes, a live trace, optional max hold, and a cursor readout of the
   frequency, level and age of whatever is under the mouse.
+- **RTL-SDR dongles** (RTL2832U with an R820T/R828D, E4000, FC0012/13 or
+  FC2580 tuner) work too, at up to 3.2 MS/s: `--source rtlsdr`.
 - **Live control** of centre frequency, gain, FFT size (256 to 262 144), window,
   overlap, detector, waterfall speed, level scale and colour map.
 - **Runs without the radio** too: a built-in signal simulator and playback of
@@ -36,11 +39,12 @@ in the 3D view with the control panel, as a 2D waterfall, and as a spectrum.
 
 Requirements: Linux, a C++20 compiler (developed with GCC 15), CMake 3.28 or
 newer, and the development packages of **libbladeRF**, **FFTW 3** (single
-precision) and **zlib**. On Debian/Ubuntu:
+precision) and **zlib**. **librtlsdr** is optional and adds RTL-SDR support. On
+Debian/Ubuntu:
 
 ```sh
 sudo apt install build-essential cmake ninja-build pkg-config \
-                 libbladerf-dev libfftw3-dev zlib1g-dev
+                 libbladerf-dev librtlsdr-dev libfftw3-dev zlib1g-dev
 ```
 
 Then:
@@ -69,13 +73,15 @@ CMake options:
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `SPECTRO_BUILD_GUI` | `ON` | `OFF` builds only the headless tool and the tests; needs no graphics libraries |
-| `SPECTRO_WITH_BLADERF` | `ON` | `OFF` builds without radio support: simulator and file playback only |
+| `SPECTRO_WITH_BLADERF` | `ON` | `OFF` builds without bladeRF support |
+| `SPECTRO_WITH_RTLSDR` | `ON` | `OFF` builds without RTL-SDR support |
 | `SPECTRO_BUILD_TESTS` | `ON` | Build the unit tests (`ctest --test-dir build`) |
 | `SPECTRO_NATIVE_ARCH` | `ON` | Compile for this machine's CPU (`-march=native`) |
 | `SPECTRO_FETCH_MISSING` | `ON` | Allow downloading the dependencies listed above |
 
-If libbladeRF is not found, CMake warns and builds the program without radio
-support.
+If libbladeRF is not found, CMake warns and builds the program without bladeRF
+support; if librtlsdr is not found, it builds without RTL-SDR support. Without
+either, the simulator and file playback still work.
 
 ## Running
 
@@ -83,6 +89,8 @@ support.
 ./build/spectrogram                                # bladeRF, 2.437 GHz, 20 MS/s
 ./build/spectrogram --freq 915M --gain 40          # another band
 ./build/spectrogram --freq 2.45G --rate 40M        # 40 MHz wide, the bladeRF x115's maximum
+./build/spectrogram --source rtlsdr                # RTL-SDR, 100 MHz, 2.4 MS/s
+./build/spectrogram --source rtlsdr --freq 433.92M --rate 1M --ppm 20
 ./build/spectrogram --source sim                   # simulator, no hardware needed
 ./build/spectrogram --file capture.sc16 --rate 20M --freq 2.437G
 ```
@@ -92,7 +100,10 @@ option; the most useful ones:
 
 | Option | Meaning |
 | --- | --- |
+| `--source bladerf\|rtlsdr\|sim\|file` | Where the samples come from (default `bladerf`) |
 | `--freq`, `--rate`, `--gain`, `--bw` | Tuning, sample rate, gain, analog bandwidth |
+| `--device ID` | Which radio, if several are connected (RTL-SDR: serial number or index) |
+| `--ppm N` | RTL-SDR: correct the crystal's frequency error |
 | `--fft N`, `--window`, `--overlap`, `--detector` | Spectrum estimation |
 | `--bins N`, `--history ROWS` | Size of the spectrogram grid (default 2048 × 512) |
 | `--view 3d\|top\|front`, `--colormap NAME` | Initial view and colours |
@@ -105,6 +116,23 @@ File playback understands `sc16` (the bladeRF's own format, as written by
 taken from the file extension unless `--format` says otherwise. A recording is
 repeated endlessly (each restart counts as a stream break) unless `--no-loop` is
 given.
+
+### RTL-SDR
+
+`--source rtlsdr` selects the first RTL-SDR dongle. Things that differ from the
+bladeRF:
+
+- **Defaults** are 100 MHz and 2.4 MS/s. The RTL2832 offers 225.001 to 300 kS/s
+  and 900.001 kS/s to 3.2 MS/s; above 2.4 MS/s most dongles lose samples.
+- **Lost samples cannot be detected.** The dongle does not timestamp its
+  samples, so the "lost" counter only shows samples this program failed to
+  take over in time, not those lost in the dongle or on the USB bus.
+- **Gain** comes in the tuner's fixed steps (29 of them between 0 and 49.6 dB
+  on an R820T); the nearest one is used. `--agc` selects the tuner's automatic gain.
+- **Samples are 8 bits wide**, so the dynamic range is much smaller than the
+  bladeRF's 12 bits; levels are still in dBFS of the converter's full scale.
+- The tuning range is that of the tuner (24 MHz to 1.766 GHz for the R820T).
+  Direct sampling (HF) and the bias tee are not supported.
 
 ### Controls
 
@@ -175,15 +203,16 @@ ctest --test-dir build --output-on-failure        # unit tests
 ## How it works
 
 ```
- bladeRF ──USB 3──▶ receive thread ──▶ IQ ring ──▶ DSP thread ──▶ row queue ──▶ render thread ──▶ GPU
-                    (libbladeRF        (lock-free,  (window, FFT,   (lock-free)   (Vulkan,
-                     sync stream)       ~0.4 s)      average/peak)                 Dear ImGui)
+ radio ────USB────▶ receive thread ──▶ IQ ring ──▶ DSP thread ──▶ row queue ──▶ render thread ──▶ GPU
+                    (libbladeRF /      (lock-free,  (window, FFT,   (lock-free)   (Vulkan,
+                     librtlsdr)         ~0.4 s)      average/peak)                 Dear ImGui)
 ```
 
 - **Receive thread** (`src/radio/`). Reads timestamped blocks from libbladeRF
   straight into a lock-free ring buffer and does nothing else, so the device is
   always serviced. A jump in the FPGA's sample timestamps is counted as lost
-  samples.
+  samples. librtlsdr delivers samples on a thread of its own, which only
+  copies them into a FIFO; the receive thread converts them from 8 to 16 bits.
 - **DSP thread** (`src/dsp/`). Windows each frame directly out of the ring
   buffer, runs FFTW, and accumulates power. One row is a fixed number of frames,
   i.e. an exact amount of signal time. The DC offset is cancelled in the
@@ -207,7 +236,7 @@ Only core Vulkan 1.0 is used, with no optional device features.
 ### Source layout
 
 ```
-src/radio/    IqSource interface; bladeRF, simulator and file sources; receive thread
+src/radio/    IqSource interface; bladeRF, RTL-SDR, simulator and file sources; receive thread
 src/dsp/      windows, SpectrumEngine (FFT, averaging, rows)
 src/gfx/      Vulkan context and swapchain, renderer, camera, colour maps, PNG writer
 src/ui/       Dear ImGui integration; 3D axes, grid and labels
@@ -243,6 +272,10 @@ Ubuntu 26.04, Mesa 26:
   no other program (bladeRF-cli, GNU Radio, …) has the device open, and that
   your user may access it (the udev rules shipped with libbladeRF; membership of
   the `plugdev` group).
+- **"Could not open the RTL-SDR"** — error −3 means your user may not access
+  the dongle (install the udev rules from the `rtl-sdr` package and replug it);
+  error −6 means another program has it open, or the kernel's DVB-T driver
+  does and could not be detached (`sudo rmmod dvb_usb_rtl28xxu`).
 - **Samples are being lost** — use a USB 3 port directly on the computer, not a
   hub, and a USB 3 cable. A USB 2 link cannot carry 20 MS/s; the program warns
   at start-up when the radio is on one.
@@ -265,11 +298,12 @@ Ubuntu 26.04, Mesa 26:
 - Developed and tested on Linux with a bladeRF x115, at 5 to 40 MS/s. The
   bladeRF 2.0 micro uses the same libbladeRF calls and should work, but has not
   been tried; neither have other operating systems.
+- RTL-SDR support was tested with an R820T dongle only.
 - Receive only, one channel.
 
 ## Third-party software
 
-libbladeRF (LGPL-2.1-or-later), FFTW (GPL-2.0-or-later), GLFW (zlib licence),
+libbladeRF (LGPL-2.1-or-later), librtlsdr (GPL-2.0-or-later), FFTW (GPL-2.0-or-later), GLFW (zlib licence),
 Dear ImGui (MIT), Vulkan headers (Apache-2.0 / MIT), glslang (BSD-3-Clause and
 others; used at build time only) and zlib. The colour maps Turbo (Apache-2.0,
 Google) and Inferno, Magma, Plasma and Viridis (CC0) are taken from matplotlib.

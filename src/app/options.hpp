@@ -45,6 +45,11 @@ struct Options {
     bool show_version = false;
 };
 
+// What the RTL-SDR starts with when --freq / --rate are not given: the bladeRF's
+// defaults (2.437 GHz, 20 MS/s) are out of its reach.
+inline constexpr double kRtlSdrDefaultFrequency  = 100e6;
+inline constexpr double kRtlSdrDefaultSampleRate = 2.4e6;
+
 // Parses argv into `options`.  On failure returns false and describes the
 // problem in `error`.
 bool parse_options(int argc, char** argv, Options& options, std::string& error);

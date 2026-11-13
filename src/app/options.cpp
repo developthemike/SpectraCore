@@ -44,7 +44,13 @@ bool parse_int(const std::string& text, int& value, std::string& error, const ch
 
 bool is_power_of_two(int v) { return v > 0 && std::has_single_bit(static_cast<unsigned>(v)); }
 
-std::vector<Flag> make_flags(Options& o)
+// Options whose default depends on the source, so we must know if they were given.
+struct Given {
+    bool frequency   = false;
+    bool sample_rate = false;
+};
+
+std::vector<Flag> make_flags(Options& o, Given& given)
 {
     std::vector<Flag> flags;
     auto add = [&flags](const char* name, const char* argument, const char* help,
@@ -53,19 +59,23 @@ std::vector<Flag> make_flags(Options& o)
     };
 
     // ---- Source ----
-    add("--source", "KIND", "Sample source: bladerf (default), sim, or file",
+    add("--source", "KIND", "Sample source: bladerf (default), rtlsdr, sim, or file",
         [&o](const std::string& v, std::string& e) {
-            if (v != "bladerf" && v != "sim" && v != "file") {
-                e = "unknown source '" + v + "' (expected bladerf, sim or file)";
+            if (v != "bladerf" && v != "rtlsdr" && v != "sim" && v != "file") {
+                e = "unknown source '" + v + "' (expected bladerf, rtlsdr, sim or file)";
                 return false;
             }
             o.source.kind = v;
             return true;
         });
-    add("--freq", "HZ", "Centre frequency, e.g. 2.437G or 915M (default 2.437G)",
-        [&o](const std::string& v, std::string& e) { return parse_number(v, o.source.frequency, e, "frequency"); });
-    add("--rate", "SPS", "Sample rate, e.g. 20M (default 20M)",
-        [&o](const std::string& v, std::string& e) {
+    add("--freq", "HZ", "Centre frequency, e.g. 2.437G or 915M (default 2.437G; RTL-SDR: 100M)",
+        [&o, &given](const std::string& v, std::string& e) {
+            given.frequency = true;
+            return parse_number(v, o.source.frequency, e, "frequency");
+        });
+    add("--rate", "SPS", "Sample rate, e.g. 20M (default 20M; RTL-SDR: 2.4M)",
+        [&o, &given](const std::string& v, std::string& e) {
+            given.sample_rate = true;
             if (!parse_number(v, o.source.sample_rate, e, "sample rate"))
                 return false;
             if (!(o.source.sample_rate > 0.0)) {
@@ -74,15 +84,26 @@ std::vector<Flag> make_flags(Options& o)
             }
             return true;
         });
-    add("--bw", "HZ", "Analog filter bandwidth (default: same as the sample rate)",
+    add("--bw", "HZ", "Analog filter bandwidth (default: same as the sample rate; RTL-SDR: chosen by the tuner)",
         [&o](const std::string& v, std::string& e) { return parse_number(v, o.source.bandwidth, e, "bandwidth"); });
     add("--gain", "DB", "Receiver gain in dB (default 30)",
         [&o](const std::string& v, std::string& e) { return parse_number(v, o.source.gain, e, "gain"); });
     add("--agc", nullptr, "Use the radio's automatic gain control instead of a fixed gain",
         [&o](const std::string&, std::string&) { o.source.agc = true; return true; });
-    add("--device", "ID", "bladeRF to open, e.g. \"*:serial=f12ce1\" (default: first one found)",
+    add("--device", "ID", "Radio to open (default: first one found). bladeRF: e.g. \"*:serial=f12ce1\"; "
+                          "RTL-SDR: serial number or index",
         [&o](const std::string& v, std::string&) { o.source.device = v; return true; });
-    add("--channel", "N", "RX channel index on multi-channel boards (default 0)",
+    add("--ppm", "N", "RTL-SDR: correct a crystal frequency error of N parts per million (default 0)",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_int(v, o.source.ppm, e, "frequency correction"))
+                return false;
+            if (o.source.ppm < -1000 || o.source.ppm > 1000) {
+                e = "the frequency correction must be between -1000 and 1000 ppm";
+                return false;
+            }
+            return true;
+        });
+    add("--channel", "N", "bladeRF: RX channel index on multi-channel boards (default 0)",
         [&o](const std::string& v, std::string& e) { return parse_int(v, o.source.channel, e, "channel"); });
     add("--file", "PATH", "IQ recording to play back (implies --source file)",
         [&o](const std::string& v, std::string&) {
@@ -253,7 +274,8 @@ bool parse_options(int argc, char** argv, Options& options, std::string& error)
     // A recording's format is detected from its extension unless stated.
     options.source.file_format = "auto";
 
-    const std::vector<Flag> flags = make_flags(options);
+    Given                   given;
+    const std::vector<Flag> flags = make_flags(options, given);
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -308,6 +330,12 @@ bool parse_options(int argc, char** argv, Options& options, std::string& error)
         error = "--db-max must be at least 5 dB above --db-min";
         return false;
     }
+    if (options.source.kind == "rtlsdr") {
+        if (!given.frequency)
+            options.source.frequency = kRtlSdrDefaultFrequency;
+        if (!given.sample_rate)
+            options.source.sample_rate = kRtlSdrDefaultSampleRate;
+    }
     options.source.verbose = options.verbose;
     return true;
 }
@@ -315,16 +343,18 @@ bool parse_options(int argc, char** argv, Options& options, std::string& error)
 std::string usage_text(const char* program)
 {
     Options           scratch;
-    const auto        flags = make_flags(scratch);
+    Given             given;
+    const auto        flags = make_flags(scratch, given);
     const std::string prog  = program ? program : "spectrogram";
 
     std::string text;
-    text += "Real-time 3D RF spectrogram waterfall for the bladeRF.\n\n";
+    text += "Real-time 3D RF spectrogram waterfall for the bladeRF and RTL-SDR.\n\n";
     text += "Usage: " + prog + " [options]\n\n";
     text += "Examples:\n";
     static const struct { const char* arguments; const char* what; } kExamples[] = {
         {"", "bladeRF at 2.437 GHz, 20 MS/s"},
         {"--freq 915M --gain 40", "another band"},
+        {"--source rtlsdr --freq 98M", "RTL-SDR dongle at 2.4 MS/s"},
         {"--source sim", "built-in signal simulator, no hardware needed"},
         {"--file capture.sc16 --rate 20M --freq 2.437G", "play back a recording"},
         {"--headless --duration 10", "stream health check without a window"},

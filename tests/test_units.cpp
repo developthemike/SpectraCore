@@ -105,6 +105,26 @@ TEST(options_parse_values)
     CHECK_NEAR(o.duration, 5.0, 1e-12);
 }
 
+TEST(options_rtlsdr_gets_its_own_defaults)
+{
+    Options     o;
+    std::string error;
+    CHECK(parse({"--source", "rtlsdr"}, o, error));
+    CHECK(o.source.kind == "rtlsdr");
+    CHECK_NEAR(o.source.frequency, kRtlSdrDefaultFrequency, 1e-6);
+    CHECK_NEAR(o.source.sample_rate, kRtlSdrDefaultSampleRate, 1e-6);
+
+    // Explicit values win, whatever the order of the arguments.
+    Options explicit_values;
+    CHECK(parse({"--freq", "433.92M", "--rate=1M", "--ppm", "-12", "--source=rtlsdr"}, explicit_values, error));
+    CHECK_NEAR(explicit_values.source.frequency, 433.92e6, 1e-6);
+    CHECK_NEAR(explicit_values.source.sample_rate, 1e6, 1e-6);
+    CHECK_EQ(explicit_values.source.ppm, -12);
+
+    Options bad;
+    CHECK(!parse({"--ppm", "5000"}, bad, error));
+}
+
 TEST(options_reject_bad_input)
 {
     Options     o;

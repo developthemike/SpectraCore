@@ -1123,8 +1123,8 @@ void App::draw_panel()
     ImGui::EndDisabled();
 
     ImGui::BeginDisabled(!info.has_gain);
-    if (ImGui::SliderInt("Gain", &gain_db_, static_cast<int>(info.gain_range.min),
-                         static_cast<int>(info.gain_range.max), "%d dB", ImGuiSliderFlags_AlwaysClamp))
+    if (ImGui::SliderInt("Gain", &gain_db_, static_cast<int>(std::floor(info.gain_range.min)),
+                         static_cast<int>(std::ceil(info.gain_range.max)), "%d dB", ImGuiSliderFlags_AlwaysClamp))
         set_gain(gain_db_);
     ImGui::EndDisabled();
 

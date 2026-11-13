@@ -1,7 +1,8 @@
 // Abstract source of complex baseband samples.
 //
 // Every source delivers the bladeRF's native sample format, SC16 Q11:
-// interleaved int16_t I/Q pairs where full scale is +/-2048.
+// interleaved int16_t I/Q pairs where full scale is +/-2048.  Sources with
+// another native format (e.g. the RTL-SDR's 8 bits) convert to it.
 #pragma once
 
 #include <cstdint>
@@ -17,16 +18,18 @@ struct ValueRange {
 };
 
 struct SourceConfig {
-    std::string kind        = "bladerf";  // "bladerf", "sim" or "file"
+    std::string kind        = "bladerf";  // "bladerf", "rtlsdr", "sim" or "file"
     double      frequency   = 2.437e9;    // Hz
     double      sample_rate = 20e6;       // samples per second
     double      bandwidth   = 0.0;        // Hz; 0 selects the sample rate
     double      gain        = 30.0;       // dB
     bool        agc         = false;
 
-    // bladeRF
-    std::string device;        // libbladeRF device identifier, empty = first found
-    int         channel = 0;   // RX channel index
+    // radios
+    std::string device;        // bladeRF: libbladeRF device identifier; RTL-SDR: serial number
+                               // or index; empty = first found
+    int         channel = 0;   // bladeRF: RX channel index
+    int         ppm     = 0;   // RTL-SDR: crystal frequency error to correct, parts per million
     bool        verbose = false;
 
     // file playback
@@ -86,7 +89,8 @@ public:
 // unknown kind or one that this build does not support.
 std::unique_ptr<IqSource> make_source(const SourceConfig& config);
 
-// Whether this build can talk to bladeRF hardware.
+// Whether this build can talk to bladeRF / RTL-SDR hardware.
 bool bladerf_supported();
+bool rtlsdr_supported();
 
 }  // namespace spectro

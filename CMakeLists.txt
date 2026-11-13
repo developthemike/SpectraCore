@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(spectrogram
     VERSION 0.1.0
-    DESCRIPTION "Real-time 3D RF spectrogram waterfall (Vulkan + bladeRF)"
+    DESCRIPTION "Real-time 3D RF spectrogram waterfall (Vulkan + bladeRF / RTL-SDR)"
     LANGUAGES C CXX)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -18,6 +18,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(SPECTRO_BUILD_GUI     "Build the Vulkan user interface (OFF: headless diagnostics only)" ON)
 option(SPECTRO_WITH_BLADERF  "Support bladeRF hardware (OFF: simulator and file playback only)" ON)
+option(SPECTRO_WITH_RTLSDR   "Support RTL-SDR dongles, if librtlsdr is installed" ON)
 option(SPECTRO_BUILD_TESTS   "Build the unit tests" ON)
 option(SPECTRO_NATIVE_ARCH   "Optimise for the CPU of the build machine (-march=native)" ON)
 option(SPECTRO_FETCH_MISSING "Download build dependencies that are not installed system-wide" ON)
@@ -73,6 +74,14 @@ if(SPECTRO_HAVE_BLADERF)
     target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_BLADERF=1)
 else()
     target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_BLADERF=0)
+endif()
+
+if(SPECTRO_HAVE_RTLSDR)
+    target_sources(spectro_core PRIVATE src/radio/rtlsdr_source.cpp)
+    target_link_libraries(spectro_core PRIVATE spectro_rtlsdr)
+    target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_RTLSDR=1)
+else()
+    target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_RTLSDR=0)
 endif()
 
 # ---------------------------------------------------------------------------

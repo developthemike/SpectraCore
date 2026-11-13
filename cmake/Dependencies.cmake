@@ -6,6 +6,7 @@
 #
 #   PkgConfig::FFTW3F   single-precision FFTW                  (required, system)
 #   spectro_bladerf     libbladeRF                             (optional, system)
+#   spectro_rtlsdr      librtlsdr                              (optional, system)
 #
 # and, when SPECTRO_BUILD_GUI is ON:
 #
@@ -84,6 +85,35 @@ if(SPECTRO_WITH_BLADERF)
     endif()
 else()
     message(STATUS "libbladeRF: disabled (SPECTRO_WITH_BLADERF=OFF)")
+endif()
+
+# --- librtlsdr (optional) --------------------------------------------------------
+set(SPECTRO_HAVE_RTLSDR OFF)
+if(SPECTRO_WITH_RTLSDR)
+    pkg_check_modules(RTLSDR IMPORTED_TARGET librtlsdr)
+    if(RTLSDR_FOUND)
+        add_library(spectro_rtlsdr INTERFACE)
+        target_link_libraries(spectro_rtlsdr INTERFACE PkgConfig::RTLSDR)
+        set(SPECTRO_HAVE_RTLSDR ON)
+    else()
+        find_path(RTLSDR_INCLUDE_DIR rtl-sdr.h)
+        find_library(RTLSDR_LIBRARY NAMES rtlsdr)
+        if(RTLSDR_INCLUDE_DIR AND RTLSDR_LIBRARY)
+            add_library(spectro_rtlsdr INTERFACE)
+            target_include_directories(spectro_rtlsdr INTERFACE "${RTLSDR_INCLUDE_DIR}")
+            target_link_libraries(spectro_rtlsdr INTERFACE "${RTLSDR_LIBRARY}")
+            set(SPECTRO_HAVE_RTLSDR ON)
+        endif()
+    endif()
+    if(SPECTRO_HAVE_RTLSDR)
+        message(STATUS "librtlsdr: found")
+    else()
+        message(STATUS
+            "librtlsdr: not found, building without RTL-SDR support "
+            "(install it with e.g. 'sudo apt install librtlsdr-dev')")
+    endif()
+else()
+    message(STATUS "librtlsdr: disabled (SPECTRO_WITH_RTLSDR=OFF)")
 endif()
 
 # Everything below is only needed for the user interface.
