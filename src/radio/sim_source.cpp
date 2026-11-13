@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <numbers>
 #include <random>
 #include <stdexcept>
@@ -31,6 +32,28 @@ constexpr double kFmCenter    = -0.19;
 constexpr double kFmDeviation = 0.015;
 constexpr double kFmRateHz    = 0.8;
 constexpr double kFmLevel     = -38.0;
+
+// A two-way radio channel.  Unlike everything else in the scene its width is
+// fixed in Hz, not a fraction of the sample rate.
+constexpr double kVoiceCenter        = -0.28;
+constexpr double kVoiceLevel         = -36.0;
+constexpr double kVoiceDeviationHz   = 1500.0;  // of a 1 kHz tone; see pre_emphasis()
+constexpr double kVoicePreEmphasisS  = 750e-6;
+constexpr double kVoiceNoteSeconds   = 0.25;
+constexpr double kVoiceNotesHz[]     = {523.25, 659.25, 783.99, 1046.50, 783.99, 659.25};  // C5 E5 G5 C6 G5 E5
+constexpr double kVoiceHalfWidthHz   = 4e3;     // room it needs on either side of its carrier
+
+// A broadcast station, in the gap between the wide-band bursts and the weak
+// carrier near the band edge.  Its width too is fixed in Hz.
+constexpr double kBroadcastCenter       = 0.38;
+constexpr double kBroadcastLevel        = -30.0;
+constexpr double kBroadcastDeviationHz  = 60e3;    // of the arpeggio, before pre-emphasis
+constexpr double kBroadcastPilotHz      = 19e3;
+constexpr double kBroadcastPilotDevHz   = 6.75e3;  // 9 % of 75 kHz
+constexpr double kBroadcastPreEmphasisS = 75e-6;
+constexpr double kBroadcastNoteSeconds  = 0.3;
+constexpr double kBroadcastNotesHz[]    = {220.0, 261.63, 329.63, 440.0, 329.63, 261.63};  // A3 C4 E4 A4 E4 C4
+constexpr double kBroadcastHalfWidthHz  = 100e3;
 
 constexpr double kChirpLo      = -0.47;
 constexpr double kChirpHi      = 0.47;
@@ -115,11 +138,29 @@ std::vector<float> make_band_noise(size_t length, double bandwidth, std::mt19937
 
 uint32_t rotl(uint32_t x, int k) { return (x << k) | (x >> (32 - k)); }
 
+// Gain of an FM transmitter's pre-emphasis (+6 dB per octave), 1 at 1 kHz.
+double pre_emphasis(double hz)
+{
+    const auto response = [](double f) { return std::hypot(1.0, kTwoPi * f * kVoicePreEmphasisS); };
+    return response(hz) / response(1000.0);
+}
+
 }  // namespace
 
 std::vector<SimSource::Carrier> SimSource::carriers(double sample_rate)
 {
     return {{-0.36 * sample_rate, -30.0}, {0.43 * sample_rate, -55.0}};
+}
+
+SimSource::VoiceChannel SimSource::voice_channel(double sample_rate)
+{
+    return {kVoiceCenter * sample_rate, kVoiceLevel, kVoiceDeviationHz};
+}
+
+SimSource::BroadcastStation SimSource::broadcast_station(double sample_rate)
+{
+    return {kBroadcastCenter * sample_rate, kBroadcastLevel, kBroadcastDeviationHz, kBroadcastPilotDevHz,
+            kBroadcastPreEmphasisS};
 }
 
 SimSource::SimSource(const SourceConfig& config)
@@ -204,6 +245,8 @@ void SimSource::start()
     for (Tone& tone : tones_)
         tone.phase = 0.0;
     fm_phase_ = chirp_phase_ = wide_phase_ = hop_phase_ = 0.0;
+    voice_phase_ = voice_audio_phase_ = 0.0;
+    broadcast_phase_ = broadcast_audio_phase_ = broadcast_pilot_phase_ = 0.0;
     chirp_freq_      = kChirpLo;
     wide_pos_ = narrow_pos_ = 0;
     burst_on_ = hop_on_ = false;
@@ -271,6 +314,67 @@ void SimSource::add_fm(int n, double shift)
         if (in_band(f, 0.0))
             rotate_add(mix_.data() + 2 * done, seg, fm_phase_, dphi, amp);
         fm_phase_ = std::fmod(fm_phase_ + dphi * seg, kTwoPi);
+        done += seg;
+    }
+}
+
+void SimSource::add_voice(int n, double shift)
+{
+    // Narrowband FM: the carrier follows an audio tone, here one note of a tune
+    // at a time.  As in add_fm() the frequency is held over short segments,
+    // which are kept below 5 us so that the steps are far above the audio band.
+    const double amp     = amplitude(kVoiceLevel);
+    const int    max_seg = std::clamp(static_cast<int>(sample_rate_ / 200e3), 1, 64);
+    const double center  = kVoiceCenter + shift;
+    const bool   on_air  = in_band(center, kVoiceHalfWidthHz / sample_rate_);
+
+    for (int done = 0; done < n;) {
+        const int    seg   = std::min(max_seg, n - done);
+        const double t     = time_s_ + done / sample_rate_;
+        const double pitch = kVoiceNotesHz[static_cast<size_t>(t / kVoiceNoteSeconds) % std::size(kVoiceNotesHz)];
+        const double audio = kTwoPi * pitch / sample_rate_;  // radians per sample
+        const double tone  = std::sin(voice_audio_phase_ + 0.5 * audio * seg);
+        const double f     = center + kVoiceDeviationHz * pre_emphasis(pitch) * tone / sample_rate_;
+        const double dphi  = kTwoPi * f;
+        if (on_air)
+            rotate_add(mix_.data() + 2 * done, seg, voice_phase_, dphi, amp);
+        voice_phase_       = std::fmod(voice_phase_ + dphi * seg, kTwoPi);
+        voice_audio_phase_ = std::fmod(voice_audio_phase_ + audio * seg, kTwoPi);
+        done += seg;
+    }
+}
+
+void SimSource::add_broadcast(int n, double shift)
+{
+    // Wideband FM, built like add_voice(): the frequency is held over segments
+    // short enough (5 us at most) that the steps lie far above the audio.  Only
+    // on air where the stream is wide enough to hold it without overlapping
+    // the rest of the scene.
+    const double center = kBroadcastCenter + shift;
+    if (sample_rate_ < kBroadcastMinRate || !in_band(center, kBroadcastHalfWidthHz / sample_rate_)) {
+        broadcast_phase_ = std::fmod(broadcast_phase_ + kTwoPi * center * n, kTwoPi);
+        return;
+    }
+    const double amp     = amplitude(kBroadcastLevel);
+    const int    max_seg = std::clamp(static_cast<int>(sample_rate_ / 200e3), 1, 64);
+    const double pilot   = kTwoPi * kBroadcastPilotHz / sample_rate_;  // radians per sample
+
+    for (int done = 0; done < n;) {
+        const int    seg   = std::min(max_seg, n - done);
+        const double t     = time_s_ + done / sample_rate_;
+        const double pitch = kBroadcastNotesHz[static_cast<size_t>(t / kBroadcastNoteSeconds) %
+                                               std::size(kBroadcastNotesHz)];
+        const double audio = kTwoPi * pitch / sample_rate_;
+        // Pre-emphasis: the gain of 1 + j w tau, which the receiver's
+        // de-emphasis (unity at low frequencies) undoes exactly.
+        const double boost = std::hypot(1.0, kTwoPi * pitch * kBroadcastPreEmphasisS);
+        const double dev   = kBroadcastDeviationHz * boost * std::sin(broadcast_audio_phase_ + 0.5 * audio * seg) +
+                             kBroadcastPilotDevHz * std::sin(broadcast_pilot_phase_ + 0.5 * pilot * seg);
+        const double dphi  = kTwoPi * (center + dev / sample_rate_);
+        rotate_add(mix_.data() + 2 * done, seg, broadcast_phase_, dphi, amp);
+        broadcast_phase_       = std::fmod(broadcast_phase_ + dphi * seg, kTwoPi);
+        broadcast_audio_phase_ = std::fmod(broadcast_audio_phase_ + audio * seg, kTwoPi);
+        broadcast_pilot_phase_ = std::fmod(broadcast_pilot_phase_ + pilot * seg, kTwoPi);
         done += seg;
     }
 }
@@ -400,6 +504,8 @@ void SimSource::generate(int n)
     for (Tone& tone : tones_)
         add_tone(tone, n, shift);
     add_fm(n, shift);
+    add_voice(n, shift);
+    add_broadcast(n, shift);
     add_chirp(n, shift);
     add_bursts(n, shift);
     add_hopper(n, shift);

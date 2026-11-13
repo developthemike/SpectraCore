@@ -2,9 +2,11 @@
 //
 // Produces a lively but fully deterministic RF scene at the configured sample
 // rate, paced to real time: a noise floor, steady and fading carriers, an FM
-// signal, a sweeping chirp, wide-band bursts and a frequency hopper.  The
-// signals live at fixed "RF" frequencies around the initial centre frequency,
-// so tuning and gain behave as they would on a real receiver.
+// signal, a sweeping chirp, wide-band bursts, a frequency hopper, a
+// narrowband FM voice channel that plays a tune and a wideband FM broadcast
+// station that plays another.  The signals live at fixed
+// "RF" frequencies around the initial centre frequency, so tuning and gain
+// behave as they would on a real receiver.
 #pragma once
 
 #include <atomic>
@@ -42,6 +44,29 @@ public:
     static std::vector<Carrier> carriers(double sample_rate);
     static constexpr double kReferenceGainDb = 30.0;
 
+    // The narrowband FM voice channel: something to listen to.  It carries a
+    // tune, pre-emphasised like speech on a two-way radio, so that a receiver
+    // with the matching de-emphasis plays every note equally loud.
+    struct VoiceChannel {
+        double offset_hz;     // from the initial centre frequency
+        double level_dbfs;    // at the reference gain
+        double deviation_hz;  // peak deviation a 1 kHz tone would have
+    };
+    static VoiceChannel voice_channel(double sample_rate);
+
+    // The wideband FM broadcast station: an arpeggio with the 19 kHz stereo
+    // pilot, pre-emphasised with 75 us like the broadcasts of the Americas.
+    // It needs a stream of at least kBroadcastMinRate to fit in.
+    struct BroadcastStation {
+        double offset_hz;        // from the initial centre frequency
+        double level_dbfs;       // at the reference gain
+        double deviation_hz;     // peak deviation of the arpeggio, before pre-emphasis
+        double pilot_hz;         // deviation of the pilot
+        double deemphasis_s;     // the matching de-emphasis
+    };
+    static BroadcastStation broadcast_station(double sample_rate);
+    static constexpr double kBroadcastMinRate = 2e6;
+
 private:
     struct Tone {
         double offset;       // fraction of the sample rate, relative to the initial centre
@@ -56,6 +81,8 @@ private:
     void add_noise(int n);
     void add_tone(Tone& tone, int n, double shift);
     void add_fm(int n, double shift);
+    void add_voice(int n, double shift);
+    void add_broadcast(int n, double shift);
     void add_chirp(int n, double shift);
     void add_bursts(int n, double shift);
     void add_hopper(int n, double shift);
@@ -86,6 +113,11 @@ private:
     // Signal state
     std::vector<Tone>  tones_;
     double             fm_phase_ = 0.0;
+    double             voice_phase_ = 0.0;        // carrier
+    double             voice_audio_phase_ = 0.0;  // the note being played
+    double             broadcast_phase_ = 0.0;        // carrier
+    double             broadcast_audio_phase_ = 0.0;  // the note being played
+    double             broadcast_pilot_phase_ = 0.0;
     double             chirp_phase_ = 0.0;
     double             chirp_freq_ = 0.0;   // cycles/sample relative to the initial centre
     size_t             wide_pos_ = 0;

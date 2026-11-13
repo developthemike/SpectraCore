@@ -1,3 +1,4 @@
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -123,6 +124,42 @@ TEST(options_rtlsdr_gets_its_own_defaults)
 
     Options bad;
     CHECK(!parse({"--ppm", "5000"}, bad, error));
+}
+
+TEST(options_listening)
+{
+    Options     defaults;
+    std::string error;
+    CHECK(parse({}, defaults, error));
+    CHECK(std::isnan(defaults.listen_frequency));  // not listening at start
+    CHECK(std::isnan(defaults.volume));
+    CHECK(std::isnan(defaults.squelch));          // squelch off
+    CHECK_NEAR(defaults.listen_bandwidth, 12.5e3, 1e-9);
+
+    Options o;
+    CHECK(parse({"--listen", "446.00625M", "--listen-bw=25k", "--volume", "80", "--squelch", "-60"}, o, error));
+    CHECK_NEAR(o.listen_frequency, 446.00625e6, 1e-3);
+    CHECK_NEAR(o.listen_bandwidth, 25e3, 1e-9);
+    CHECK_NEAR(o.volume, 80.0, 1e-12);
+    CHECK_NEAR(o.squelch, -60.0, 1e-12);
+
+    CHECK_NEAR(defaults.deemphasis_us, 75.0, 1e-12);
+
+    Options wide;
+    CHECK(parse({"--listen", "98.1M", "--listen-bw", "200k", "--deemphasis", "50us"}, wide, error));
+    CHECK_NEAR(wide.listen_bandwidth, 200e3, 1e-9);
+    CHECK_NEAR(wide.deemphasis_us, 50.0, 1e-12);
+    CHECK(parse({"--deemphasis=75"}, wide, error));
+    CHECK_NEAR(wide.deemphasis_us, 75.0, 1e-12);
+
+    Options bad;
+    CHECK(!parse({"--listen", "-5M"}, bad, error));
+    CHECK(!parse({"--listen-bw", "30k"}, bad, error));  // between narrowband and wideband
+    CHECK(!parse({"--listen-bw", "2k"}, bad, error));
+    CHECK(!parse({"--listen-bw", "400k"}, bad, error));
+    CHECK(!parse({"--deemphasis", "60"}, bad, error));
+    CHECK(!parse({"--volume", "150"}, bad, error));
+    CHECK(!parse({"--squelch", "5"}, bad, error));
 }
 
 TEST(options_reject_bad_input)

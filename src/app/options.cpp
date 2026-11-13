@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "audio/listener.hpp"
 #include "util/units.hpp"
 
 namespace spectro {
@@ -191,6 +192,65 @@ std::vector<Flag> make_flags(Options& o, Given& given)
             return true;
         });
 
+    // ---- Listening ----
+    add("--listen", "HZ", "Play the FM signal at this frequency (in the window: Ctrl + click)",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_number(v, o.listen_frequency, e, "frequency"))
+                return false;
+            if (!(o.listen_frequency > 0.0)) {
+                e = "the frequency must be positive";
+                return false;
+            }
+            return true;
+        });
+    add("--listen-bw", "HZ", "Channel width: 5k to 25k narrowband FM (default 12.5k), 100k to 300k wideband FM",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_number(v, o.listen_bandwidth, e, "bandwidth"))
+                return false;
+            if (!Listener::valid_bandwidth(o.listen_bandwidth)) {
+                e = "the channel width must be 5k to 25k (narrowband FM) or 100k to 300k (wideband FM)";
+                return false;
+            }
+            return true;
+        });
+    add("--deemphasis", "US", "Wideband FM de-emphasis in microseconds: 75 (default; the Americas) or 50",
+        [&o](const std::string& v, std::string& e) {
+            std::string number = v;
+            for (const char* suffix : {"us", "u", "\xC2\xB5s"}) {
+                const std::string_view s(suffix);
+                if (number.size() > s.size() && number.compare(number.size() - s.size(), s.size(), s) == 0) {
+                    number.resize(number.size() - s.size());
+                    break;
+                }
+            }
+            if (number != "50" && number != "75") {
+                e = "the de-emphasis must be 50 or 75 (microseconds)";
+                return false;
+            }
+            o.deemphasis_us = number == "50" ? 50.0 : 75.0;
+            return true;
+        });
+    add("--volume", "PCT", "Audio volume, 0 to 100 (default 50)",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_number(v, o.volume, e, "volume"))
+                return false;
+            if (!(o.volume >= 0.0 && o.volume <= 100.0)) {
+                e = "the volume must be between 0 and 100";
+                return false;
+            }
+            return true;
+        });
+    add("--squelch", "DB", "Mute the audio while the channel is below this level in dBFS (default: off)",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_number(v, o.squelch, e, "level"))
+                return false;
+            if (!(o.squelch >= -120.0 && o.squelch <= 0.0)) {
+                e = "the squelch level must be between -120 and 0 dBFS";
+                return false;
+            }
+            return true;
+        });
+
     // ---- Display ----
     add("--db-min", "DB", "Bottom of the level scale in dBFS (default: automatic)",
         [&o](const std::string& v, std::string& e) { return parse_number(v, o.db_min, e, "level"); });
@@ -355,6 +415,7 @@ std::string usage_text(const char* program)
         {"", "bladeRF at 2.437 GHz, 20 MS/s"},
         {"--freq 915M --gain 40", "another band"},
         {"--source rtlsdr --freq 98M", "RTL-SDR dongle at 2.4 MS/s"},
+        {"--source rtlsdr --freq 446M --listen 446.00625M", "and listen to an FM channel"},
         {"--source sim", "built-in signal simulator, no hardware needed"},
         {"--file capture.sc16 --rate 20M --freq 2.437G", "play back a recording"},
         {"--headless --duration 10", "stream health check without a window"},

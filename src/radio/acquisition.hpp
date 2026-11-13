@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -25,6 +26,14 @@ struct AcquisitionStats {
     std::string error;               // set when failed
 };
 
+// Receives a copy of every block of samples as it arrives, on the receive
+// thread.  It must not block: that thread has to get back to the device.
+class IqTap {
+public:
+    virtual ~IqTap() = default;
+    virtual void on_samples(const int16_t* iq, size_t samples) = 0;
+};
+
 class Acquisition {
 public:
     Acquisition(IqSource& source, IqRing& ring);
@@ -37,6 +46,10 @@ public:
     void start();
     // Stops and joins the thread.  The source may be stopped afterwards.
     void stop();
+
+    // Installs a tap, or removes it with nullptr.  May be called at any time
+    // from any thread; when it returns, the previous tap is no longer in use.
+    void set_tap(IqTap* tap);
 
     AcquisitionStats stats() const;
 
@@ -59,6 +72,10 @@ private:
 
     mutable std::mutex error_mutex_;
     std::string        error_;
+
+    std::mutex        tap_mutex_;       // held while the tap is being called
+    IqTap*            tap_ = nullptr;
+    std::atomic<bool> has_tap_{false};  // lets the receive thread skip the lock
 };
 
 }  // namespace spectro
