@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <thread>
 
+#include "radio/sample_convert.hpp"
+
 namespace spectro {
 
 namespace {
@@ -190,12 +192,9 @@ int FileSource::read(int16_t* iq, int max_samples, ReadStatus& status)
             iq[i] = static_cast<int16_t>(src[i] * 16);
         break;
     }
-    case Format::CU8: {
-        const uint8_t* src = raw_.data();
-        for (size_t i = 0; i < values; ++i)
-            iq[i] = to_q11((static_cast<float>(src[i]) - 127.5f) * 16.0f);
+    case Format::CU8:
+        cu8_to_q11(raw_.data(), iq, values);
         break;
-    }
     }
 
     // Pace playback to the recording's sample rate.

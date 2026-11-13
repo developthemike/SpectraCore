@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(spectrogram
     VERSION 0.1.0
-    DESCRIPTION "Real-time 3D RF spectrogram waterfall (Vulkan + bladeRF)"
+    DESCRIPTION "Real-time 3D RF spectrogram waterfall (Vulkan + bladeRF / RTL-SDR)"
     LANGUAGES C CXX)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -18,6 +18,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(SPECTRO_BUILD_GUI     "Build the Vulkan user interface (OFF: headless diagnostics only)" ON)
 option(SPECTRO_WITH_BLADERF  "Support bladeRF hardware (OFF: simulator and file playback only)" ON)
+option(SPECTRO_WITH_RTLSDR   "Support RTL-SDR dongles, if librtlsdr is installed" ON)
+option(SPECTRO_WITH_AUDIO    "Play FM audio (needs the user interface; fetches miniaudio)" ON)
 option(SPECTRO_BUILD_TESTS   "Build the unit tests" ON)
 option(SPECTRO_NATIVE_ARCH   "Optimise for the CPU of the build machine (-march=native)" ON)
 option(SPECTRO_FETCH_MISSING "Download build dependencies that are not installed system-wide" ON)
@@ -57,10 +59,12 @@ add_library(spectro_core STATIC
     src/util/units.cpp
     src/dsp/window.cpp
     src/dsp/spectrum_engine.cpp
+    src/dsp/fm_demod.cpp
     src/radio/iq_source.cpp
     src/radio/sim_source.cpp
     src/radio/file_source.cpp
     src/radio/acquisition.cpp
+    src/audio/listener.cpp
     src/app/options.cpp
     src/app/pipeline.cpp)
 target_include_directories(spectro_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -73,6 +77,14 @@ if(SPECTRO_HAVE_BLADERF)
     target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_BLADERF=1)
 else()
     target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_BLADERF=0)
+endif()
+
+if(SPECTRO_HAVE_RTLSDR)
+    target_sources(spectro_core PRIVATE src/radio/rtlsdr_source.cpp)
+    target_link_libraries(spectro_core PRIVATE spectro_rtlsdr)
+    target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_RTLSDR=1)
+else()
+    target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_RTLSDR=0)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -99,6 +111,13 @@ if(SPECTRO_BUILD_GUI)
     target_link_libraries(spectrogram PRIVATE
         spectro_vulkan spectro_glfw spectro_imgui ZLIB::ZLIB)
     target_compile_definitions(spectrogram PRIVATE SPECTRO_HAVE_GUI=1 GLFW_INCLUDE_NONE)
+    if(SPECTRO_HAVE_AUDIO)
+        target_sources(spectrogram PRIVATE src/audio/audio_output.cpp)
+        target_link_libraries(spectrogram PRIVATE spectro_miniaudio)
+        target_compile_definitions(spectrogram PRIVATE SPECTRO_HAVE_AUDIO=1)
+    else()
+        target_compile_definitions(spectrogram PRIVATE SPECTRO_HAVE_AUDIO=0)
+    endif()
     spectro_add_shaders(spectrogram
         INCLUDES shaders/common.glsl
         SOURCES
@@ -122,7 +141,8 @@ if(SPECTRO_BUILD_TESTS)
         tests/test_ring.cpp
         tests/test_units.cpp
         tests/test_spectrum.cpp
-        tests/test_sources.cpp)
+        tests/test_sources.cpp
+        tests/test_audio.cpp)
     target_link_libraries(spectro_tests PRIVATE spectro_core spectro_flags)
     add_test(NAME spectro_tests COMMAND spectro_tests)
 endif()

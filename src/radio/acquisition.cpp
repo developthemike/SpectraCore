@@ -35,6 +35,13 @@ void Acquisition::stop()
     thread_.join();
 }
 
+void Acquisition::set_tap(IqTap* tap)
+{
+    std::lock_guard<std::mutex> lock(tap_mutex_);
+    tap_ = tap;
+    has_tap_.store(tap != nullptr, std::memory_order_release);
+}
+
 AcquisitionStats Acquisition::stats() const
 {
     AcquisitionStats s;
@@ -96,6 +103,12 @@ void Acquisition::run()
         }
         if (n == 0)
             continue;  // timeout: try again
+
+        if (has_tap_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(tap_mutex_);
+            if (tap_)
+                tap_->on_samples(dest, static_cast<size_t>(n));
+        }
 
         if (discard) {
             ring_dropped_.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);

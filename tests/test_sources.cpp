@@ -11,6 +11,8 @@
 #include "app/pipeline.hpp"
 #include "radio/acquisition.hpp"
 #include "radio/file_source.hpp"
+#include "radio/rtlsdr_source.hpp"
+#include "radio/sample_convert.hpp"
 #include "radio/sim_source.hpp"
 #include "test_framework.hpp"
 
@@ -338,6 +340,44 @@ TEST(file_source_rejects_bad_input)
         threw = true;
     }
     CHECK(threw);
+}
+
+TEST(cu8_samples_convert_to_q11)
+{
+    const uint8_t in[] = {0, 127, 128, 255};
+    int16_t       out[4] = {};
+    cu8_to_q11(in, out, 4);
+    CHECK_EQ(out[0], -2040);
+    CHECK_EQ(out[1], -8);
+    CHECK_EQ(out[2], 8);
+    CHECK_EQ(out[3], 2040);
+}
+
+TEST(rtlsdr_rates_and_gain_steps)
+{
+    CHECK(rtlsdr_rate_supported(250e3));
+    CHECK(rtlsdr_rate_supported(1e6));
+    CHECK(rtlsdr_rate_supported(2.4e6));
+    CHECK(rtlsdr_rate_supported(3.2e6));
+    CHECK(!rtlsdr_rate_supported(225e3));
+    CHECK(!rtlsdr_rate_supported(500e3));
+    CHECK(!rtlsdr_rate_supported(20e6));
+
+    // Part of the R820T's gain list.
+    const std::vector<double> gains = {0.0, 0.9, 1.4, 2.7, 25.4, 28.0, 29.7, 32.8, 33.8, 49.6};
+    // The nearest entry, whatever the distance ...
+    CHECK_EQ(rtlsdr_pick_gain(gains, 30.0, 30.0), size_t{6});
+    CHECK_EQ(rtlsdr_pick_gain(gains, 29.7, 40.0), size_t{8});
+    CHECK_EQ(rtlsdr_pick_gain(gains, 29.7, -5.0), size_t{0});
+    CHECK_EQ(rtlsdr_pick_gain(gains, 29.7, 99.0), size_t{9});
+    // ... but a 1 dB step always moves, even across a 3 dB gap in the list,
+    CHECK_EQ(rtlsdr_pick_gain(gains, 29.7, 30.7), size_t{7});
+    CHECK_EQ(rtlsdr_pick_gain(gains, 29.7, 28.7), size_t{5});
+    // while asking for what is already set changes nothing,
+    CHECK_EQ(rtlsdr_pick_gain(gains, 29.7, 30.0), size_t{6});
+    // and the ends of the list hold.
+    CHECK_EQ(rtlsdr_pick_gain(gains, 49.6, 50.6), size_t{9});
+    CHECK_EQ(rtlsdr_pick_gain(gains, 0.0, -1.0), size_t{0});
 }
 
 TEST(acquisition_tracks_stream_health)

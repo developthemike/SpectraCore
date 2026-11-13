@@ -30,6 +30,13 @@ struct Options {
     double      db_max   = std::numeric_limits<double>::quiet_NaN();
     bool        hide_ui  = false;
 
+    // Listening: FM audio of one channel
+    double listen_frequency = std::numeric_limits<double>::quiet_NaN();  // Hz; NaN = not at start
+    double listen_bandwidth = 12.5e3;  // Hz; up to 25 kHz narrowband FM, from 100 kHz wideband FM
+    double deemphasis_us    = 75.0;    // wideband FM: 75 (the Americas, South Korea) or 50 (elsewhere)
+    double volume           = std::numeric_limits<double>::quiet_NaN();  // percent; NaN = default
+    double squelch          = std::numeric_limits<double>::quiet_NaN();  // dBFS; NaN = off
+
     // Diagnostics and automation
     bool        list_gpus        = false;
     bool        validation       = false;  // enable the Vulkan validation layers
@@ -44,6 +51,13 @@ struct Options {
     bool show_help    = false;
     bool show_version = false;
 };
+
+// What the RTL-SDR starts with when --freq / --rate are not given: the bladeRF's
+// defaults (2.437 GHz, 20 MS/s) are out of its reach.
+inline constexpr double kRtlSdrDefaultFrequency  = 100e6;
+inline constexpr double kRtlSdrDefaultSampleRate = 2.4e6;
+
+inline constexpr double kDefaultVolume = 50.0;  // percent
 
 // Parses argv into `options`.  On failure returns false and describes the
 // problem in `error`.

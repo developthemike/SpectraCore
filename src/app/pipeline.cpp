@@ -21,6 +21,12 @@ void Pipeline::start()
     if (started_)
         return;
 
+    // Left over from a previous run; each refers to the ones before it.
+    listener_.reset();
+    acquisition_.reset();
+    engine_.reset();
+    ring_.reset();
+
     source_->start();  // throws if the device or file cannot be opened
 
     // Room for ~0.4 s of signal between the receive and DSP threads: plenty to
@@ -33,8 +39,10 @@ void Pipeline::start()
     engine_ = std::make_unique<SpectrumEngine>(*ring_, rate, columns_);
     engine_->set_params(initial_params_);
     acquisition_ = std::make_unique<Acquisition>(*source_, *ring_);
+    listener_    = std::make_unique<Listener>(*source_, *acquisition_);
 
     engine_->start();
+    listener_->start();
     acquisition_->start();
     started_ = true;
 }
@@ -45,6 +53,7 @@ void Pipeline::stop()
         return;
     // Order matters: stop reading, let the DSP thread finish, then close the device.
     acquisition_->stop();
+    listener_->stop();
     engine_->stop();
     source_->stop();
     started_ = false;

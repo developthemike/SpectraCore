@@ -6,12 +6,14 @@
 #
 #   PkgConfig::FFTW3F   single-precision FFTW                  (required, system)
 #   spectro_bladerf     libbladeRF                             (optional, system)
+#   spectro_rtlsdr      librtlsdr                              (optional, system)
 #
 # and, when SPECTRO_BUILD_GUI is ON:
 #
 #   spectro_vulkan      Vulkan headers + loader
 #   spectro_glfw        GLFW 3.3+
 #   spectro_imgui       Dear ImGui + its GLFW/Vulkan backends  (always fetched)
+#   spectro_miniaudio   miniaudio, for audio output            (optional, always fetched)
 #   ZLIB::ZLIB          for PNG screenshots                    (required, system)
 #
 # plus SPECTRO_SHADER_COMPILER / SPECTRO_SHADER_COMPILER_KIND for Shaders.cmake.
@@ -28,6 +30,9 @@ set(SPECTRO_GLFW_SHA256 c038d34200234d071fae9345bc455e4a8f2f544ab60150765d7704e0
 
 set(SPECTRO_IMGUI_URL "https://github.com/ocornut/imgui/archive/refs/tags/v1.93.0.tar.gz")
 set(SPECTRO_IMGUI_SHA256 f7bf6bc76e5d79d40d751096663e6c5d18daf08129dd52e7f7b09e4251c8eeee)
+
+set(SPECTRO_MINIAUDIO_URL "https://github.com/mackron/miniaudio/archive/refs/tags/0.11.26.tar.gz")
+set(SPECTRO_MINIAUDIO_SHA256 838ba55a21c9142adf7b76bdc4351e5cd8b7ae128f46b25ec25f94ae9969c600)
 
 set(SPECTRO_GLSLANG_URL
     "https://github.com/KhronosGroup/glslang/archive/refs/tags/vulkan-sdk-1.4.341.0.tar.gz")
@@ -84,6 +89,35 @@ if(SPECTRO_WITH_BLADERF)
     endif()
 else()
     message(STATUS "libbladeRF: disabled (SPECTRO_WITH_BLADERF=OFF)")
+endif()
+
+# --- librtlsdr (optional) --------------------------------------------------------
+set(SPECTRO_HAVE_RTLSDR OFF)
+if(SPECTRO_WITH_RTLSDR)
+    pkg_check_modules(RTLSDR IMPORTED_TARGET librtlsdr)
+    if(RTLSDR_FOUND)
+        add_library(spectro_rtlsdr INTERFACE)
+        target_link_libraries(spectro_rtlsdr INTERFACE PkgConfig::RTLSDR)
+        set(SPECTRO_HAVE_RTLSDR ON)
+    else()
+        find_path(RTLSDR_INCLUDE_DIR rtl-sdr.h)
+        find_library(RTLSDR_LIBRARY NAMES rtlsdr)
+        if(RTLSDR_INCLUDE_DIR AND RTLSDR_LIBRARY)
+            add_library(spectro_rtlsdr INTERFACE)
+            target_include_directories(spectro_rtlsdr INTERFACE "${RTLSDR_INCLUDE_DIR}")
+            target_link_libraries(spectro_rtlsdr INTERFACE "${RTLSDR_LIBRARY}")
+            set(SPECTRO_HAVE_RTLSDR ON)
+        endif()
+    endif()
+    if(SPECTRO_HAVE_RTLSDR)
+        message(STATUS "librtlsdr: found")
+    else()
+        message(STATUS
+            "librtlsdr: not found, building without RTL-SDR support "
+            "(install it with e.g. 'sudo apt install librtlsdr-dev')")
+    endif()
+else()
+    message(STATUS "librtlsdr: disabled (SPECTRO_WITH_RTLSDR=OFF)")
 endif()
 
 # Everything below is only needed for the user interface.
@@ -187,6 +221,34 @@ target_compile_definitions(spectro_imgui PUBLIC
 target_compile_features(spectro_imgui PUBLIC cxx_std_17)
 target_link_libraries(spectro_imgui PUBLIC spectro_vulkan spectro_glfw)
 set_target_properties(spectro_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# --- miniaudio (optional) --------------------------------------------------------
+# Like ImGui it is distributed as source to compile in.  It looks for
+# PulseAudio / PipeWire, ALSA or JACK when the program runs, so building needs
+# no audio development packages.
+set(SPECTRO_HAVE_AUDIO OFF)
+if(SPECTRO_WITH_AUDIO)
+    spectro_fetch_sources(miniaudio "${SPECTRO_MINIAUDIO_URL}" ${SPECTRO_MINIAUDIO_SHA256})
+    add_library(spectro_miniaudio STATIC "${miniaudio_SOURCE_DIR}/miniaudio.c")
+    target_include_directories(spectro_miniaudio SYSTEM PUBLIC "${miniaudio_SOURCE_DIR}")
+    # Only its device layer is used; leave out the decoders, mixer and so on.
+    target_compile_definitions(spectro_miniaudio PUBLIC
+        MA_NO_DECODING
+        MA_NO_ENCODING
+        MA_NO_GENERATION
+        MA_NO_RESOURCE_MANAGER
+        MA_NO_NODE_GRAPH
+        MA_NO_ENGINE)
+    target_link_libraries(spectro_miniaudio PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+    if(UNIX)
+        target_link_libraries(spectro_miniaudio PUBLIC m)
+    endif()
+    set_target_properties(spectro_miniaudio PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    set(SPECTRO_HAVE_AUDIO ON)
+    message(STATUS "Audio output: miniaudio (fetched)")
+else()
+    message(STATUS "Audio output: disabled (SPECTRO_WITH_AUDIO=OFF)")
+endif()
 
 # --- GLSL -> SPIR-V compiler ---------------------------------------------------
 find_program(SPECTRO_GLSLC NAMES glslc HINTS ENV VULKAN_SDK PATH_SUFFIXES bin)

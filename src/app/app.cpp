@@ -20,9 +20,14 @@
 
 #include "app/pipeline.hpp"
 #include "app/signals.hpp"
+#include "audio/listener.hpp"
+#if SPECTRO_HAVE_AUDIO
+#include "audio/audio_output.hpp"
+#endif
 #include "gfx/camera.hpp"
 #include "gfx/colormap.hpp"
 #include "gfx/renderer.hpp"
+#include "radio/sim_source.hpp"
 #include "ui/axes.hpp"
 #include "ui/ui.hpp"
 #include "util/log.hpp"
@@ -40,6 +45,11 @@ constexpr int   kPopBatch    = 64;
 constexpr float kFloorDb     = SpectrumEngine::kFloorDb;
 
 constexpr int kFftSizes[] = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144};
+
+// Listening: channel widths on offer, and the squelch slider's "off" position.
+constexpr double kNarrowWidthsHz[] = {8e3, 10e3, 12.5e3, 16e3, 20e3, 25e3};
+constexpr double kWideWidthsHz[]   = {100e3, 150e3, 200e3, 250e3};
+constexpr float  kSquelchSliderOff = -120.0f;
 
 // Automatic level scale: the noise floor sits this far above the bottom, the
 // strongest signal this far below the top.
@@ -130,17 +140,34 @@ private:
     void toggle_fullscreen();
     void run_self_test(double elapsed);
     void probe_cursor(float column_fraction, int row_depth, bool verify);
+    void self_test_listen(bool wide);
+    void self_test_check_audio(bool wide);
     void update_cursor_readout();
+    bool surface_under(float window_x, float window_y, Vec3& hit, Vec3* entry = nullptr) const;
+    double frequency_at(float x) const;
     float surface_height(float x, float z, float* db_out = nullptr, float* age_rows_out = nullptr) const;
     void toast(const std::string& text);
     void update_title();
+
+    // Listening
+    void set_listening(bool on);
+    void toggle_listening();
+    void listen_to(double hz, double search_hz);
+    bool choose_channel_at(float window_x, float window_y, bool find_carrier);
+    void update_listening();
+    bool listen_in_band() const;
+    double listen_bandwidth() const;  // as used: limited to what the stream can carry
+    bool   listen_wide() const;
 
     // Drawing
     void draw_panel();
     void draw_status();
     void draw_help();
     void draw_axis_labels();
+    void draw_listen_window();
+    void draw_listen_label();
     void build_lines();
+    void add_listen_box(float pixel_ratio);
     SceneParams scene_params() const;
     Mat4        view_projection() const;
     float       aspect() const;
@@ -224,6 +251,23 @@ private:
 
     double tune_mhz_ = 0.0;
     int    gain_db_  = 0;
+
+    // The channel being listened to (FM audio)
+    struct Listening {
+        bool   on        = false;  // audio is wanted
+        bool   selected  = false;  // a channel has been chosen
+        double frequency = 0.0;    // Hz
+        double bandwidth = Listener::kDefaultBandwidth;      // also chooses narrowband or wideband FM
+        double deemphasis = FmDemodulator::kDefaultDeemphasis;  // wideband FM, seconds
+        float  volume    = 0.5f;   // 0..1
+        float  squelch   = FmDemodulator::kSquelchOff;  // dBFS
+    } listen_;
+    double       listen_mhz_ = 0.0;
+    ListenStatus listen_status_;
+    bool         choosing_ = false;  // a Ctrl + drag across the plot is in progress
+#if SPECTRO_HAVE_AUDIO
+    std::unique_ptr<AudioOutput> audio_;
+#endif
 
     Clock::time_point start_time_;
     Clock::time_point last_frame_time_;
@@ -332,12 +376,36 @@ App::App(const Options& options)
                                                                                  : ViewPreset::Perspective);
     update_title();
 
+    // Listening.  The self-test exercises the whole audio path too, but
+    // silently unless a volume was asked for.
+    const double volume = !std::isnan(options_.volume) ? options_.volume : options_.self_test ? 0.0 : kDefaultVolume;
+    listen_.volume      = static_cast<float>(volume / 100.0);
+    listen_.bandwidth   = options_.listen_bandwidth;
+    listen_.deemphasis  = options_.deemphasis_us * 1e-6;
+    if (!std::isnan(options_.squelch))
+        listen_.squelch = static_cast<float>(options_.squelch);
+    if (!std::isnan(options_.listen_frequency)) {
+        listen_to(options_.listen_frequency, 0.0);
+        if (!listen_in_band()) {
+            const IqSource& source = pipeline_.source();
+            LOG_WARN("--listen %s is outside the band being received (%s ... %s); tune there to hear it",
+                     format_frequency(options_.listen_frequency).c_str(),
+                     format_frequency(source.frequency() - 0.5 * source.sample_rate()).c_str(),
+                     format_frequency(source.frequency() + 0.5 * source.sample_rate()).c_str());
+        }
+    }
+
     start_time_      = Clock::now();
     last_frame_time_ = start_time_;
 }
 
 App::~App()
 {
+    // The sound device first: it reads from the pipeline's audio FIFO.
+    set_listening(false);
+#if SPECTRO_HAVE_AUDIO
+    audio_.reset();
+#endif
     // Stop the radio before tearing down the display.
     pipeline_.stop();
     if (vk_ && vk_->device != VK_NULL_HANDLE)
@@ -374,6 +442,14 @@ int App::run()
              static_cast<unsigned long long>(rows_missed_ + pipeline_.engine().stats().rows_dropped),
              static_cast<unsigned long long>(pipeline_.engine().stats().rows_emitted +
                                              pipeline_.engine().stats().rows_dropped));
+
+    const ListenStatus audio = pipeline_.listener().status();
+    if (audio.audio_samples > 0) {
+        LOG_INFO("Audio: %.1f s demodulated; gaps: %llu; discarded for the sound card: %llu; samples missed: %llu",
+                 static_cast<double>(audio.audio_samples) / Listener::kAudioRate,
+                 static_cast<unsigned long long>(audio.underruns), static_cast<unsigned long long>(audio.overruns),
+                 static_cast<unsigned long long>(audio.dropped_iq));
+    }
 
     int exit_code = 0;
     if (vk_->validation_active()) {
@@ -734,7 +810,9 @@ void App::run_self_test(double elapsed)
         {6.5, "gain"},              {7.0, "pause"},           {7.6, "resume"},
         {8.0, "hide the panel"},    {8.5, "max hold"},        {9.0, "restore the defaults"},
         {10.0, "top view"},         {10.6, "cursor readout in the top view"},
-        {11.0, "cursor readout in the 3D view"},              {12.0, "finish"},
+        {11.0, "listen to a signal (Ctrl + click)"},          {11.6, "cursor readout in the 3D view"},
+        {12.6, "check the audio"},  {13.0, "listen to a broadcast station (wideband FM)"},
+        {14.6, "check the wideband audio"},                   {15.0, "finish"},
     };
     constexpr int kStepCount = static_cast<int>(std::size(kSteps));
     if (self_test_step_ >= kStepCount || elapsed < kSteps[self_test_step_].at)
@@ -771,9 +849,13 @@ void App::run_self_test(double elapsed)
              apply_view(ViewPreset::Perspective); break;
     case 17: apply_view(ViewPreset::Top); break;
     case 18: probe_cursor(0.3f, 20, true); break;
-    case 19: apply_view(ViewPreset::Perspective); probe_cursor(0.62f, 60, false);
+    case 19: self_test_listen(false); break;
+    case 20: apply_view(ViewPreset::Perspective); probe_cursor(0.62f, 60, false);
              if (!options_.screenshot_path.empty()) take_screenshot(options_.screenshot_path);
              break;
+    case 21: self_test_check_audio(false); break;
+    case 22: apply_view(ViewPreset::Top); self_test_listen(true); break;
+    case 23: self_test_check_audio(true); apply_view(ViewPreset::Perspective); break;
     default: glfwSetWindowShouldClose(window, GLFW_TRUE); break;
     }
     ++self_test_step_;
@@ -812,6 +894,100 @@ void App::probe_cursor(float column_fraction, int row_depth, bool verify)
                                                               pipeline_.source().sample_rate());
         probe_frames_ = 3;
     }
+}
+
+// Self-test: the audio path, from choosing a signal in the plot to the sound
+// device.  It "clicks" on the plot in the top view, in the middle of a display
+// column.  With the simulator that is the column showing its narrowband voice
+// channel or its broadcast station, whose carrier lies somewhere within the
+// column: the receiver has to find it, and what it then plays is known.  On a
+// radio any column will do to exercise the path.
+void App::self_test_listen(bool wide)
+{
+#if SPECTRO_HAVE_AUDIO
+    Listener& listener = pipeline_.listener();
+    if (!listener.available() || (wide && !listener.supports(FmMode::Wide)))
+        return;
+    const IqSource& source = pipeline_.source();
+    const double    fs     = source.sample_rate();
+    double          offset = (wide ? 0.3 : 0.2) * fs;
+    if (options_.source.kind == "sim" && (!wide || fs >= SimSource::kBroadcastMinRate)) {
+        offset = options_.source.frequency - source.frequency() +
+                 (wide ? SimSource::broadcast_station(fs).offset_hz : SimSource::voice_channel(fs).offset_hz);
+    }
+    listen_.bandwidth = wide ? FmDemodulator::kWideDefaultBandwidth : Listener::kDefaultBandwidth;
+    listener.set_bandwidth(listen_.bandwidth);
+
+    const float column_width = kPlotWidth / static_cast<float>(columns_);
+    const float column       = std::round(static_cast<float>((offset / fs + 0.5) * columns_) - column_phase());
+    const float x            = -0.5f * kPlotWidth + (column + column_phase()) * column_width;
+    const float z            = 0.5f * view_.plot_depth -
+                               (20.0f + scroll_phase_) * view_.plot_depth / static_cast<float>(history_ - 1);
+
+    const ImGuiIO& io = ImGui::GetIO();
+    float          sx = 0.0f, sy = 0.0f;
+    if (!project_to_screen(view_projection(), {x, surface_height(x, z), z}, io.DisplaySize.x, io.DisplaySize.y, sx, sy) ||
+        !choose_channel_at(sx, sy, true)) {
+        LOG_ERROR("self-test: could not choose a signal in the plot");
+        self_test_failed_ = true;
+    }
+#else
+    (void)wide;
+#endif
+}
+
+void App::self_test_check_audio(bool wide)
+{
+#if SPECTRO_HAVE_AUDIO
+    Listener& listener = pipeline_.listener();
+    if (!listener.available() || (wide && !listener.supports(FmMode::Wide)))
+        return;
+    const ListenStatus status = listener.status();
+    LOG_INFO("self-test: %s audio of %.5f MHz: level %.1f dBFS, loudness %.2f, %.2f s demodulated, %llu gap(s), "
+             "audio thread %.1f %% of a core, %.0f ms buffered (sound card period %.0f ms), on %s",
+             status.mode == FmMode::Wide ? "wideband" : "narrowband", status.frequency / 1e6,
+             static_cast<double>(status.level_dbfs), static_cast<double>(status.audio_rms),
+             static_cast<double>(status.audio_samples) / Listener::kAudioRate,
+             static_cast<unsigned long long>(status.underruns), static_cast<double>(status.load) * 100.0,
+             1e3 * static_cast<double>(listener.audio().fill()) / Listener::kAudioRate,
+             1e3 * static_cast<double>(listener.audio().largest_read()) / Listener::kAudioRate,
+             audio_ ? audio_->description().c_str() : "nothing");
+
+    bool ok = listen_.on && status.in_band && !status.searching && status.dropped_iq == 0 &&
+              (status.mode == FmMode::Wide) == wide &&
+              status.audio_samples >= static_cast<uint64_t>(Listener::kAudioRate) / 2;
+    const double fs = pipeline_.source().sample_rate();
+    if (ok && options_.source.kind == "sim" && (!wide || fs >= SimSource::kBroadcastMinRate)) {
+        // The carrier was found, and the tune comes out as loud as it should.
+        double carrier = 0.0, level = 0.0, amplitude = 0.0;
+        if (wide) {
+            const SimSource::BroadcastStation station = SimSource::broadcast_station(fs);
+            carrier   = station.offset_hz;
+            level     = station.level_dbfs;
+            amplitude = station.deviation_hz / FmDemodulator::kWideDeviation;  // pre- and de-emphasis cancel
+        } else {
+            // Every note like a 1 kHz tone of the channel's nominal deviation.
+            const SimSource::VoiceChannel voice = SimSource::voice_channel(fs);
+            carrier   = voice.offset_hz;
+            level     = voice.level_dbfs;
+            amplitude = voice.deviation_hz / (0.4 * listen_bandwidth());
+        }
+        const double loudness = amplitude / std::sqrt(2.0);
+        ok = status.squelch_open && std::fabs(status.frequency - (options_.source.frequency + carrier)) < 2000.0 &&
+             std::fabs(status.level_dbfs - level) < 2.0 && std::fabs(status.audio_rms - loudness) < 0.25 * loudness;
+    }
+    if (!ok) {
+        LOG_ERROR("self-test: the audio is not what it should be");
+        self_test_failed_ = true;
+    }
+    if (!wide)
+        return;  // the wideband test follows
+    set_listening(false);
+    listen_.bandwidth = Listener::kDefaultBandwidth;
+    listener.set_bandwidth(listen_.bandwidth);
+#else
+    (void)wide;
+#endif
 }
 
 // Height of the displayed surface above the floor at a point of the plot, the
@@ -855,28 +1031,18 @@ float App::surface_height(float x, float z, float* db_out, float* age_rows_out) 
     return level * view_.plot_height;
 }
 
-// Finds the point of the surface under the mouse cursor by marching the view
-// ray across the height field.
-void App::update_cursor_readout()
+// Finds the point of the surface under a position in the window by marching
+// the view ray across the height field.  False if the ray misses the surface.
+// `entry`, if given, receives the point where the ray enters the plot's
+// bounding box - set whenever the ray passes through the box at all.
+bool App::surface_under(float window_x, float window_y, Vec3& hit, Vec3* entry) const
 {
-    cursor_.valid = false;
     const ImGuiIO& io = ImGui::GetIO();
-    if (!have_row_ || io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f)
-        return;
+    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f)
+        return false;
 
-    float mouse_x = probe_x_, mouse_y = probe_y_;
-    if (!probe_active_) {
-        if (io.WantCaptureMouse || io.MousePos.x < 0.0f || io.MousePos.y < 0.0f)
-            return;
-        if (ImGui::IsMouseDown(ImGuiMouseButton_Left) || ImGui::IsMouseDown(ImGuiMouseButton_Right) ||
-            ImGui::IsMouseDown(ImGuiMouseButton_Middle))
-            return;  // the mouse is busy moving the camera
-        mouse_x = io.MousePos.x;
-        mouse_y = io.MousePos.y;
-    }
-
-    const float ndc_x = 2.0f * mouse_x / io.DisplaySize.x - 1.0f - lens_shift_;
-    const float ndc_y = 2.0f * mouse_y / io.DisplaySize.y - 1.0f;
+    const float ndc_x = 2.0f * window_x / io.DisplaySize.x - 1.0f - lens_shift_;
+    const float ndc_y = 2.0f * window_y / io.DisplaySize.y - 1.0f;
     Vec3 origin, dir;
     camera_.ray(ndc_x, ndc_y, aspect(), origin, dir);
 
@@ -893,7 +1059,7 @@ void App::update_cursor_readout()
     for (int axis = 0; axis < 3; ++axis) {
         if (std::fabs(d[axis]) < 1e-9f) {
             if (o[axis] < box_min[axis] || o[axis] > box_max[axis])
-                return;
+                return false;
             continue;
         }
         float t0 = (box_min[axis] - o[axis]) / d[axis];
@@ -904,7 +1070,9 @@ void App::update_cursor_readout()
         t_exit  = std::min(t_exit, t1);
     }
     if (t_enter > t_exit)
-        return;
+        return false;
+    if (entry)
+        *entry = origin + dir * t_enter;
 
     // March in steps of at most half a grid cell, then refine by bisection.
     const float step_x = std::fabs(d[0]) > 1e-6f ? 0.5f * column_width / std::fabs(d[0]) : 1e9f;
@@ -937,20 +1105,52 @@ void App::update_cursor_readout()
         }
     }
     if (t_hit < 0.0f)
+        return false;
+
+    hit = origin + dir * t_hit;
+    return true;
+}
+
+// The frequency shown at a position along the plot's frequency axis.
+double App::frequency_at(float x) const
+{
+    const IqSource& source       = pipeline_.source();
+    const float     column_width = kPlotWidth / static_cast<float>(columns_);
+    const float     x_min        = -0.5f * kPlotWidth + column_phase() * column_width;
+    const double    column       = (x - x_min) / column_width;
+    return source.frequency() + SpectrumEngine::column_frequency(column, columns_, fft_size_, source.sample_rate());
+}
+
+// What is under the mouse cursor: a marker on the surface and its values.
+void App::update_cursor_readout()
+{
+    cursor_.valid = false;
+    const ImGuiIO& io = ImGui::GetIO();
+    if (!have_row_)
         return;
 
-    const Vec3 hit = origin + dir * t_hit;
+    float mouse_x = probe_x_, mouse_y = probe_y_;
+    if (!probe_active_) {
+        if (io.WantCaptureMouse || io.MousePos.x < 0.0f || io.MousePos.y < 0.0f)
+            return;
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left) || ImGui::IsMouseDown(ImGuiMouseButton_Right) ||
+            ImGui::IsMouseDown(ImGuiMouseButton_Middle))
+            return;  // the mouse is busy moving the camera
+        mouse_x = io.MousePos.x;
+        mouse_y = io.MousePos.y;
+    }
+
+    Vec3 hit;
+    if (!surface_under(mouse_x, mouse_y, hit))
+        return;
     float      db = kFloorDb, age_rows = 0.0f;
     const float height = surface_height(hit.x, hit.z, &db, &age_rows);
     if (db <= kFloorDb + 1.0f)
         return;  // empty history or a gap marker: nothing to read
 
-    const IqSource& source = pipeline_.source();
-    const double    column = (hit.x - x_min) / column_width;
     cursor_.valid        = true;
     cursor_.world        = {hit.x, height, hit.z};
-    cursor_.frequency_hz = source.frequency() +
-                           SpectrumEngine::column_frequency(column, columns_, fft_size_, source.sample_rate());
+    cursor_.frequency_hz = frequency_at(hit.x);
     cursor_.level_db     = db;
     cursor_.seconds_ago  = static_cast<double>(age_rows) * row_period_;
 
@@ -975,12 +1175,23 @@ void App::handle_input()
 {
     ImGuiIO& io = ImGui::GetIO();
 
-    // ---- Mouse: orbit, pan, zoom ----
+    // ---- Mouse: choose a channel, orbit, pan, zoom ----
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        choosing_ = false;
     if (!io.WantCaptureMouse) {
         const bool pan_drag = ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f) ||
                               ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f) ||
                               (io.KeyShift && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f));
-        if (pan_drag) {
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && io.KeyCtrl && !io.KeyShift) {
+            // Ctrl + click: listen to the signal under the cursor.
+            choosing_ = true;
+            choose_channel_at(io.MousePos.x, io.MousePos.y, true);
+        } else if (choosing_) {
+            // ... and dragging on from there slides the channel along.  (Only
+            // once the mouse has clearly moved: a click is rarely perfectly still.)
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f))
+                choose_channel_at(io.MousePos.x, io.MousePos.y, false);
+        } else if (pan_drag) {
             if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f) {
                 camera_.pan(io.MouseDelta.x, io.MouseDelta.y, io.DisplaySize.y);
                 camera_untouched_ = false;
@@ -996,7 +1207,7 @@ void App::handle_input()
             camera_.zoom(io.MouseWheel);
             camera_untouched_ = false;
         }
-        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !io.KeyCtrl)
             apply_view(preset_);
     }
 
@@ -1041,6 +1252,8 @@ void App::handle_input()
             std::fill(max_hold_.begin(), max_hold_.end(), kFloorDb);
         toast(view_.max_hold ? "Max hold on" : "Max hold off");
     }
+    if (pressed(ImGuiKey_L))
+        toggle_listening();
     if (pressed(ImGuiKey_P) || pressed(ImGuiKey_F12))
         take_screenshot({});
     if (pressed(ImGuiKey_F11) || pressed(ImGuiKey_F))
@@ -1072,6 +1285,197 @@ void App::handle_input()
                                            2.0, 1000.0);
         pipeline_.engine().set_params(params);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Listening
+// ---------------------------------------------------------------------------
+
+void App::set_listening(bool on)
+{
+    if (on == listen_.on)
+        return;
+#if SPECTRO_HAVE_AUDIO
+    Listener& listener = pipeline_.listener();
+    if (!on) {
+        listener.set_enabled(false);
+        if (audio_)
+            audio_->stop();
+        listen_.on = false;
+        return;
+    }
+    if (!listener.available()) {
+        toast("The sample rate is too low to hold an FM channel");
+        return;
+    }
+    if (!audio_)
+        audio_ = std::make_unique<AudioOutput>(listener.audio(), Listener::kAudioRate);
+    std::string message;
+    const bool  started = audio_->start(message);
+    if (!message.empty()) {
+        LOG_WARN("%s", message.c_str());
+        toast(message);
+    }
+    if (!started)
+        return;
+    listener.set_bandwidth(listen_.bandwidth);
+    listener.set_deemphasis(listen_.deemphasis);
+    listener.set_volume(listen_.volume);
+    listener.set_squelch(listen_.squelch);
+    listener.set_enabled(true);
+    listen_.on = true;
+#else
+    toast("This build has no audio support");
+#endif
+}
+
+// The L key and the "Listen" check box.  Turning the audio on resumes the last
+// channel, or starts in the middle of the band if there is none in it.
+void App::toggle_listening()
+{
+    if (listen_.on || (listen_.selected && listen_in_band())) {
+        set_listening(!listen_.on);
+        return;
+    }
+    listen_to(pipeline_.source().frequency(), 0.0);
+    if (listen_.on)
+        toast("Ctrl + click a signal to listen to it");
+}
+
+// Selects the channel to listen to and turns the audio on.  With `search_hz`
+// the receiver looks for the carrier that far around `hz` and centres on it.
+void App::listen_to(double hz, double search_hz)
+{
+    listen_.selected  = true;
+    listen_.frequency = hz;
+    listen_mhz_       = hz / 1e6;
+    pipeline_.listener().tune(hz, search_hz);
+    set_listening(true);
+}
+
+// Listens to what the plot shows at a position in the window.  A click means
+// "that signal", but the display is only as fine as its columns and the hand
+// not much finer, so with `find_carrier` the receiver looks for the carrier
+// nearby; without it the channel is placed exactly where the cursor is.
+bool App::choose_channel_at(float window_x, float window_y, bool find_carrier)
+{
+    // Above the trace in the front view the ray skims over the surface without
+    // touching it; where it enters the plot is then the frequency meant.
+    constexpr float kNone = -1e30f;
+    Vec3            hit, entry{kNone, 0.0f, 0.0f};
+    if (!surface_under(window_x, window_y, hit, &entry)) {
+        if (entry.x == kNone)
+            return false;
+        hit = entry;
+    }
+    const double column_hz = pipeline_.source().sample_rate() / columns_;
+    listen_to(frequency_at(hit.x), find_carrier ? std::max(0.5 * column_hz, 0.25 * listen_bandwidth()) : 0.0);
+    return true;
+}
+
+void App::update_listening()
+{
+    listen_status_ = pipeline_.listener().status();
+    if (listen_.on)
+        listen_.frequency = listen_status_.frequency;  // a search moves it onto the carrier
+}
+
+// Whether the channel lies inside the band being received (and displayed).
+bool App::listen_in_band() const
+{
+    const IqSource& source = pipeline_.source();
+    return std::fabs(listen_.frequency - source.frequency()) + 0.5 * listen_bandwidth() <=
+           0.5 * source.sample_rate();
+}
+
+double App::listen_bandwidth() const
+{
+    return FmDemodulator::usable_bandwidth(pipeline_.source().sample_rate(), Listener::kAudioRate, listen_.bandwidth);
+}
+
+bool App::listen_wide() const
+{
+    return FmDemodulator::mode_for(listen_bandwidth()) == FmMode::Wide;
+}
+
+// The channel being played, as a box around its part of the plot: as wide as
+// the channel filter, as deep as the history, as tall as the level scale.  It
+// is bright while there is something to hear and dim while the squelch mutes.
+void App::add_listen_box(float pixel_ratio)
+{
+    if (!listen_.on)
+        return;
+    const IqSource& source = pipeline_.source();
+    const double    span   = source.sample_rate();
+    const double    lo     = (listen_.frequency - 0.5 * listen_bandwidth() - source.frequency()) / span;
+    const double    hi     = (listen_.frequency + 0.5 * listen_bandwidth() - source.frequency()) / span;
+    if (hi <= -0.5 || lo >= 0.5)
+        return;  // not on the display at all
+
+    const float x0 = static_cast<float>(std::max(lo, -0.5)) * kPlotWidth;
+    const float x1 = static_cast<float>(std::min(hi, 0.5)) * kPlotWidth;
+    // A hair outside the data, like the frame, so that its lines do not fight
+    // the surface's walls for the same depth.
+    const float eps = 0.003f * kPlotWidth;
+    const float z0  = 0.5f * view_.plot_depth + eps;
+    const float z1  = -0.5f * view_.plot_depth - eps;
+    const float y0  = 0.0f, y1 = view_.plot_height;
+
+    const bool     audible = listen_in_band() && listen_status_.squelch_open;
+    const uint32_t color   = audible ? pack_rgba(110, 255, 190, 255) : pack_rgba(150, 200, 180, 190);
+    const float    width   = (audible ? 1.8f : 1.3f) * pixel_ratio;
+    const auto     edge    = [&](Vec3 a, Vec3 b) {
+        LineInstance line{};
+        line.start[0]   = a.x;
+        line.start[1]   = a.y;
+        line.start[2]   = a.z;
+        line.width      = width;
+        line.end[0]     = b.x;
+        line.end[1]     = b.y;
+        line.end[2]     = b.z;
+        line.depth_bias = 1e-4f;
+        line.color      = color;
+        lines_.push_back(line);
+    };
+    for (const float x : {x0, x1}) {
+        for (const float y : {y0, y1})
+            edge({x, y, z0}, {x, y, z1});  // along the time axis
+    }
+    for (const float z : {z0, z1}) {
+        edge({x0, y0, z}, {x1, y0, z});
+        edge({x0, y1, z}, {x1, y1, z});
+        edge({x0, y0, z}, {x0, y1, z});
+        edge({x1, y0, z}, {x1, y1, z});
+    }
+}
+
+// Names the box: the frequency being played, above its front edge.
+void App::draw_listen_label()
+{
+    if (!listen_.on || !view_.labels)
+        return;
+    const IqSource& source = pipeline_.source();
+    const double    center = (listen_.frequency - source.frequency()) / source.sample_rate();
+    if (std::fabs(center) > 0.5)
+        return;
+
+    const ImGuiIO& io = ImGui::GetIO();
+    const Vec3     anchor{static_cast<float>(center) * kPlotWidth, view_.plot_height, 0.5f * view_.plot_depth};
+    float          x = 0.0f, y = 0.0f;
+    if (!project_to_screen(view_projection(), anchor, io.DisplaySize.x, io.DisplaySize.y, x, y))
+        return;
+
+    char text[64];
+    std::snprintf(text, sizeof(text), "%s %.5f MHz", listen_wide() ? "WFM" : "NFM", listen_.frequency / 1e6);
+    const bool   audible = listen_in_band() && listen_status_.squelch_open;
+    const ImVec2 size    = ImGui::CalcTextSize(text);
+    const float  line    = ImGui::GetFontSize();
+    const ImVec2 pad(0.45f * line, 0.2f * line);
+    const ImVec2 pos(std::round(x - 0.5f * size.x), std::round(y - size.y - pad.y - 0.5f * line));
+    ImDrawList*  draw = ImGui::GetBackgroundDrawList();
+    draw->AddRectFilled(ImVec2(pos.x - pad.x, pos.y - pad.y), ImVec2(pos.x + size.x + pad.x, pos.y + size.y + pad.y),
+                        IM_COL32(8, 12, 16, 190), 0.3f * line);
+    draw->AddText(pos, audible ? IM_COL32(110, 255, 190, 255) : IM_COL32(150, 200, 180, 220), text);
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,8 +1527,8 @@ void App::draw_panel()
     ImGui::EndDisabled();
 
     ImGui::BeginDisabled(!info.has_gain);
-    if (ImGui::SliderInt("Gain", &gain_db_, static_cast<int>(info.gain_range.min),
-                         static_cast<int>(info.gain_range.max), "%d dB", ImGuiSliderFlags_AlwaysClamp))
+    if (ImGui::SliderInt("Gain", &gain_db_, static_cast<int>(std::floor(info.gain_range.min)),
+                         static_cast<int>(std::ceil(info.gain_range.max)), "%d dB", ImGuiSliderFlags_AlwaysClamp))
         set_gain(gain_db_);
     ImGui::EndDisabled();
 
@@ -1271,9 +1675,132 @@ void App::draw_panel()
     ImGui::SameLine();
     if (ImGui::Button("Help (F1)"))
         view_.show_help = !view_.show_help;
+#if SPECTRO_HAVE_AUDIO
+    ImGui::SameLine();
+    bool listening = listen_.on;
+    if (ImGui::Checkbox("Listen", &listening))
+        toggle_listening();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Play the FM audio of one channel, narrowband or wideband (L).\n"
+                          "Ctrl + click a signal in the plot to choose it.");
+#endif
 
     ImGui::PopItemWidth();
     ImGui::End();
+}
+
+// The controls of the channel being listened to, in a window of their own
+// that is only there while the audio is on.
+void App::draw_listen_window()
+{
+#if SPECTRO_HAVE_AUDIO
+    if (!listen_.on)
+        return;
+    const ImGuiIO& io     = ImGui::GetIO();
+    const float    scale  = imgui_->ui_scale();
+    const float    margin = 12.0f * scale;
+    const float    width  = 300.0f * scale;
+    Listener&      listener = pipeline_.listener();
+
+    // Top right, below the status box, where it hides the least of the plot.
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - margin, 132.0f * scale), ImGuiCond_FirstUseEver,
+                            ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0.0f), ImVec2(width, io.DisplaySize.y));
+    // (The "###" part keeps the window the same while its title changes.)
+    const bool wide = listen_wide();
+    bool       open = true;
+    if (ImGui::Begin(wide ? "Listen: wideband FM###listen" : "Listen: narrowband FM###listen", &open,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::PushItemWidth(-80.0f * scale);
+
+        // Typed frequencies are taken literally; the step buttons move by
+        // 500 Hz, or by a 12.5 kHz channel with Ctrl held.
+        if (ImGui::InputDouble("MHz", &listen_mhz_, 0.0005, 0.0125, "%.5f", ImGuiInputTextFlags_EnterReturnsTrue))
+            listen_to(listen_mhz_ * 1e6, 0.0);
+        if (!ImGui::IsItemActive() && !ImGui::IsItemFocused())
+            listen_mhz_ = listen_.frequency / 1e6;
+
+        // The width also chooses the kind of FM.  Only what the stream can
+        // carry is offered.
+        char label[48];
+        std::snprintf(label, sizeof(label), "%g kHz  %s", listen_bandwidth() / 1e3, wide ? "WFM" : "NFM");
+        if (ImGui::BeginCombo("Width", label)) {
+            const auto group = [&](const char* title, FmMode mode, const double* widths, size_t count) {
+                if (!listener.supports(mode))
+                    return;
+                ImGui::TextDisabled("%s", title);
+                for (size_t i = 0; i < count; ++i) {
+                    if (widths[i] > listener.widest(mode) + 1.0)
+                        continue;
+                    std::snprintf(label, sizeof(label), "  %g kHz", widths[i] / 1e3);
+                    if (ImGui::Selectable(label, widths[i] == listen_.bandwidth)) {
+                        listen_.bandwidth = widths[i];
+                        listener.set_bandwidth(widths[i]);
+                    }
+                }
+            };
+            group("Narrowband FM (voice)", FmMode::Narrow, kNarrowWidthsHz, std::size(kNarrowWidthsHz));
+            group("Wideband FM (broadcast)", FmMode::Wide, kWideWidthsHz, std::size(kWideWidthsHz));
+            ImGui::EndCombo();
+        }
+
+        if (wide) {
+            static const char* const kDeemphasisNames[] = {"75 \xC2\xB5s (the Americas)", "50 \xC2\xB5s (elsewhere)"};
+            int choice = listen_.deemphasis < 62.5e-6 ? 1 : 0;
+            if (ImGui::Combo("De-emph.", &choice, kDeemphasisNames, 2)) {
+                listen_.deemphasis = choice == 1 ? 50e-6 : 75e-6;
+                listener.set_deemphasis(listen_.deemphasis);
+            }
+        }
+
+        int volume = static_cast<int>(std::lround(listen_.volume * 100.0f));
+        if (ImGui::SliderInt("Volume", &volume, 0, 100, "%d %%", ImGuiSliderFlags_AlwaysClamp)) {
+            listen_.volume = static_cast<float>(volume) / 100.0f;
+            listener.set_volume(listen_.volume);
+        }
+
+        float squelch = std::max(listen_.squelch, kSquelchSliderOff);
+        if (ImGui::SliderFloat("Squelch", &squelch, kSquelchSliderOff, 0.0f,
+                               squelch <= kSquelchSliderOff ? "off" : "%.0f dBFS", ImGuiSliderFlags_AlwaysClamp)) {
+            listen_.squelch = squelch <= kSquelchSliderOff + 0.5f ? FmDemodulator::kSquelchOff : squelch;
+            listener.set_squelch(listen_.squelch);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Mute the audio while the channel is below this level");
+
+        if (!listen_in_band()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f), "Outside the received band");
+        } else {
+            ImGui::Text("Level  %.1f dBFS", static_cast<double>(listen_status_.level_dbfs));
+            ImGui::SameLine();
+            if (listen_status_.searching)
+                ImGui::TextDisabled("  finding the carrier");
+            else if (listen_status_.squelch_open)
+                ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1.0f), "  playing");
+            else
+                ImGui::TextDisabled("  squelched");
+        }
+        if (listen_status_.underruns > 0 || listen_status_.dropped_iq > 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f), "Gaps in the audio: %llu",
+                               static_cast<unsigned long long>(listen_status_.underruns));
+            if (listen_status_.dropped_iq > 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f), "  samples missed: %llu",
+                                   static_cast<unsigned long long>(listen_status_.dropped_iq));
+            }
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        if (audio_)
+            ImGui::TextWrapped("%s", audio_->description().c_str());
+        ImGui::TextWrapped("Ctrl + click or drag in the plot to choose a signal");
+        ImGui::PopStyleColor();
+
+        ImGui::PopItemWidth();
+    }
+    ImGui::End();
+    if (!open)
+        set_listening(false);
+#endif
 }
 
 void App::draw_status()
@@ -1311,6 +1838,8 @@ void App::draw_status()
                                static_cast<unsigned long long>(lost));
         else
             ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1.0f), "  no samples lost");
+        if (listen_.on)
+            ImGui::Text("Audio %.5f MHz", listen_.frequency / 1e6);
         if (view_.paused)
             ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "PAUSED (Space to resume)");
         if (!view_.show_panel)
@@ -1354,6 +1883,8 @@ void App::draw_help()
             {"Right / middle drag, Shift + drag", "Move the view"},
             {"Mouse wheel", "Zoom"},
             {"Double click, R", "Reset the view"},
+            {"Ctrl + click or drag", "Listen to the signal under the cursor (FM)"},
+            {"L", "Audio on / off"},
             {"1 / 2 / 3", "3D view / top view (2D waterfall) / front view (spectrum)"},
             {"Left / Right", "Tune down / up (Shift: fine, Ctrl: half the span)"},
             {"Up / Down", "Gain up / down (Shift: 5 dB steps)"},
@@ -1491,6 +2022,7 @@ void App::build_lines()
     axes.pixel_ratio     = pixel_ratio;
     axes.show_grid       = view_.grid;
     build_axes(axes, lines_, labels_);
+    add_listen_box(pixel_ratio);
 
     // Spectrum traces along the front edge of the plot.
     if (!have_row_)
@@ -1552,9 +2084,12 @@ void App::frame()
 
     imgui_->begin_frame();
     handle_input();
+    update_listening();
     panel_fraction_ = 0.0f;
-    if (view_.show_panel)
+    if (view_.show_panel) {
         draw_panel();  // sets panel_fraction_ while docked at the left edge
+        draw_listen_window();
+    }
     lens_shift_ += (panel_fraction_ - lens_shift_) * (1.0f - std::exp(-dt * 10.0f));
     if (camera_untouched_ && (std::fabs(plot_aspect() - framed_aspect_) > 1e-3f ||
                               view_.plot_height != framed_height_ || view_.plot_depth != framed_depth_))
@@ -1577,6 +2112,7 @@ void App::frame()
     }
     build_lines();
     draw_axis_labels();
+    draw_listen_label();
     ImGui::Render();
     ++frames_drawn_;
 
