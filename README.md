@@ -452,3 +452,10 @@ Google) and Inferno, Magma, Plasma and Viridis (CC0) are taken from matplotlib.
 
 Note that FFTW is licensed under the GPL: if you distribute binaries of this
 program, the GPL's terms apply to them.
+
+## AI-assisted development
+
+This project is developed with the help of AI-assisted tools: some of its
+code, tests and documentation were written or changed with their assistance.
+As with any software, check that it does what you need before relying on it;
+see the [licence](LICENSE) for the terms it comes under.
