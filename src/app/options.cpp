@@ -240,6 +240,28 @@ std::vector<Flag> make_flags(Options& o, Given& given)
             }
             return true;
         });
+    add("--scan", nullptr, "Listen by scanning: play each signal above --scan-threshold while it lasts",
+        [&o](const std::string&, std::string&) { o.scan = true; return true; });
+    add("--scan-threshold", "DB", "Level in dBFS a signal's peak must reach (default: 15 dB above the noise)",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_number(v, o.scan_threshold, e, "level"))
+                return false;
+            if (!(o.scan_threshold >= -200.0 && o.scan_threshold <= 20.0)) {
+                e = "the scan threshold must be between -200 and 20 dBFS";
+                return false;
+            }
+            return true;
+        });
+    add("--scan-hang", "SEC", "How long to wait for a signal that has stopped before moving on (default 2)",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_number(v, o.scan_hang, e, "time"))
+                return false;
+            if (!(o.scan_hang >= 0.0 && o.scan_hang <= 60.0)) {
+                e = "the hang time must be between 0 and 60 seconds";
+                return false;
+            }
+            return true;
+        });
     add("--squelch", "DB", "Mute the audio while the channel is below this level in dBFS (default: off)",
         [&o](const std::string& v, std::string& e) {
             if (!parse_number(v, o.squelch, e, "level"))
@@ -382,6 +404,10 @@ bool parse_options(int argc, char** argv, Options& options, std::string& error)
         }
     }
 
+    if (options.scan && !std::isnan(options.listen_frequency)) {
+        error = "--scan and --listen exclude each other";
+        return false;
+    }
     if (options.source.kind == "file" && options.source.file_path.empty()) {
         error = "--source file needs --file <path>";
         return false;
@@ -416,6 +442,7 @@ std::string usage_text(const char* program)
         {"--freq 915M --gain 40", "another band"},
         {"--source rtlsdr --freq 98M", "RTL-SDR dongle at 2.4 MS/s"},
         {"--source rtlsdr --freq 446M --listen 446.00625M", "and listen to an FM channel"},
+        {"--source rtlsdr --freq 446M --scan", "or scan for signals"},
         {"--source sim", "built-in signal simulator, no hardware needed"},
         {"--file capture.sc16 --rate 20M --freq 2.437G", "play back a recording"},
         {"--headless --duration 10", "stream health check without a window"},

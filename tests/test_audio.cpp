@@ -12,6 +12,7 @@
 
 #include "app/pipeline.hpp"
 #include "audio/audio_fifo.hpp"
+#include "audio/audio_scope.hpp"
 #include "audio/listener.hpp"
 #include "audio/rate_control.hpp"
 #include "dsp/fm_demod.hpp"
@@ -572,6 +573,12 @@ TEST(listener_plays_the_simulators_voice_channel)
         CHECK(played.size() > 19'200);
         if (played.size() > 19'200)
             CHECK(share_of_tune(std::vector<float>(played.end() - 19'200, played.end()), amplitude / 4.0) > 0.7);
+        // The plot shows the audio before the volume control: still full size.
+        {
+            std::vector<float> plotted(24'000);
+            CHECK_EQ(listener.scope().latest(plotted.data(), plotted.size()), plotted.size());
+            CHECK(share_of_tune(plotted, amplitude) > 0.7);
+        }
         listener.set_volume(1.0f);
 
         // Tuned 4 kHz off, as after a click on a coarse display, with a search
@@ -816,4 +823,58 @@ TEST(listener_plays_the_simulators_broadcast_station)
     CHECK_EQ(stats.lost_samples, uint64_t{0});
     CHECK_EQ(stats.ring_dropped, uint64_t{0});
     pipeline.stop();
+}
+
+TEST(audio_scope_keeps_the_latest_audio)
+{
+    AudioScope         scope;
+    std::vector<float> out(1000), mins(10), maxs(10);
+    CHECK_EQ(scope.latest(out.data(), 10), size_t{0});
+
+    std::vector<float> ramp(200);
+    for (size_t i = 0; i < ramp.size(); ++i)
+        ramp[i] = static_cast<float>(i) / 1000.0f;
+    scope.write(ramp.data(), 70, false);
+    scope.write(ramp.data() + 70, 130, false);
+    CHECK_EQ(scope.written(), uint64_t{200});
+
+    // The latest samples, oldest first, and no more than there are.
+    CHECK_EQ(scope.latest(out.data(), 50), size_t{50});
+    CHECK_EQ(out[0], 0.150f);
+    CHECK_EQ(out[49], 0.199f);
+    CHECK_EQ(scope.latest(out.data(), 1000), size_t{200});
+    CHECK_EQ(out[0], 0.0f);
+
+    // Complete blocks of 64: their lowest and highest values.
+    CHECK_EQ(scope.latest_blocks(mins.data(), maxs.data(), 10), size_t{3});
+    CHECK_EQ(mins[0], 0.0f);
+    CHECK_EQ(maxs[0], 0.063f);
+    CHECK_EQ(mins[2], 0.128f);
+    CHECK_EQ(maxs[2], 0.191f);
+
+    // Muted stretches are silence.
+    scope.write(ramp.data(), 56, true);
+    CHECK_EQ(scope.latest(out.data(), 1), size_t{1});
+    CHECK_EQ(out[0], 0.0f);
+    CHECK_EQ(scope.latest_blocks(mins.data(), maxs.data(), 1), size_t{1});
+    CHECK_EQ(mins[0], 0.0f);
+    CHECK_EQ(maxs[0], 0.199f);
+
+    // After many seconds it still has the latest, and never hands out more
+    // than half its length at once.
+    std::vector<float> block(4096);
+    for (int round = 0; round < 160; ++round) {
+        for (size_t i = 0; i < block.size(); ++i)
+            block[i] = static_cast<float>(round);
+        scope.write(block.data(), block.size(), false);
+    }
+    CHECK(scope.written() > AudioScope::kCapacity);
+    CHECK_EQ(scope.latest(out.data(), 1000), size_t{1000});
+    CHECK_EQ(out[0], 159.0f);
+    std::vector<float> lots(AudioScope::kCapacity);
+    CHECK_EQ(scope.latest(lots.data(), lots.size()), AudioScope::kMaxRead);
+    CHECK_EQ(lots[AudioScope::kMaxRead - 1], 159.0f);
+    std::vector<float> many_min(AudioScope::kBlocks), many_max(AudioScope::kBlocks);
+    CHECK_EQ(scope.latest_blocks(many_min.data(), many_max.data(), many_min.size()), AudioScope::kMaxRead / AudioScope::kBlock);
+    CHECK_EQ(many_max[AudioScope::kMaxRead / AudioScope::kBlock - 1], 159.0f);
 }

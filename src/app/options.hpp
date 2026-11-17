@@ -36,6 +36,9 @@ struct Options {
     double deemphasis_us    = 75.0;    // wideband FM: 75 (the Americas, South Korea) or 50 (elsewhere)
     double volume           = std::numeric_limits<double>::quiet_NaN();  // percent; NaN = default
     double squelch          = std::numeric_limits<double>::quiet_NaN();  // dBFS; NaN = off
+    bool   scan             = false;   // listen by scanning for signals
+    double scan_threshold   = std::numeric_limits<double>::quiet_NaN();  // dBFS; NaN = from the noise floor
+    double scan_hang        = 2.0;     // seconds
 
     // Diagnostics and automation
     bool        list_gpus        = false;

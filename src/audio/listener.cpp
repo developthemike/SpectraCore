@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "audio/rate_control.hpp"
@@ -107,21 +108,39 @@ void Listener::set_enabled(bool enabled)
     acquisition_.set_tap(enabled ? this : nullptr);
 }
 
-void Listener::tune(double frequency_hz, double search_hz)
+void Listener::tune(double frequency_hz, double search_hz, double bandwidth_hz)
 {
     change([&](Params& p) {
         p.frequency = frequency_hz;
         p.search    = std::max(0.0, search_hz);
+        if (bandwidth_hz > 0.0)
+            p.bandwidth = clamp_bandwidth(bandwidth_hz);
         ++p.tune_serial;
     });
 }
 
+// Between the two ranges, the nearer one.
+double Listener::clamp_bandwidth(double hz)
+{
+    return hz < 0.5 * (kMaxNarrowBandwidth + kMinWideBandwidth) ? std::clamp(hz, kMinNarrowBandwidth, kMaxNarrowBandwidth)
+                                                                : std::clamp(hz, kMinWideBandwidth, kMaxWideBandwidth);
+}
+
 void Listener::set_bandwidth(double hz)
 {
-    // Between the two ranges, the nearer one.
-    hz = hz < 0.5 * (kMaxNarrowBandwidth + kMinWideBandwidth) ? std::clamp(hz, kMinNarrowBandwidth, kMaxNarrowBandwidth)
-                                                              : std::clamp(hz, kMinWideBandwidth, kMaxWideBandwidth);
+    hz = clamp_bandwidth(hz);
     change([&](Params& p) { p.bandwidth = hz; });
+}
+
+void Listener::set_muted(bool muted)
+{
+    change([&](Params& p) { p.muted = muted; });
+}
+
+double Listener::scan_frequency() const
+{
+    const ListenStatus s = status();
+    return s.searching ? std::numeric_limits<double>::quiet_NaN() : s.frequency;
 }
 
 void Listener::set_deemphasis(double seconds)
@@ -147,10 +166,12 @@ ListenStatus Listener::status() const
         s.enabled   = params_.enabled;
         s.frequency = params_.frequency;
         s.bandwidth = usable_bandwidth(params_.bandwidth);
+        // Until the audio thread has taken over the latest tune() - and found
+        // the carrier, if asked to - the frequency is not final.
+        s.searching = s.enabled && st_settled_serial_.load(std::memory_order_acquire) != params_.tune_serial;
     }
     s.mode          = FmDemodulator::mode_for(s.bandwidth);
     s.in_band       = st_in_band_.load(std::memory_order_relaxed);
-    s.searching     = st_searching_.load(std::memory_order_relaxed);
     s.squelch_open  = st_squelch_open_.load(std::memory_order_relaxed);
     s.level_dbfs    = st_level_.load(std::memory_order_relaxed);
     s.audio_rms     = st_audio_rms_.load(std::memory_order_relaxed);
@@ -278,7 +299,8 @@ void Listener::run()
 
         // 4. Volume, then into the FIFO at a rate that keeps its fill level steady.
         if (!audio.empty()) {
-            const float target_gain = p.volume * p.volume;
+            scope_.write(audio.data(), audio.size(), p.muted);
+            const float target_gain = p.muted ? 0.0f : p.volume * p.volume;
             for (float& v : audio) {
                 gain += kGainSmoothing * (target_gain - gain);
                 v = std::clamp(v * gain, -1.0f, 1.0f);
@@ -300,7 +322,8 @@ void Listener::run()
         // 5. Status.
         const FmDemodulator::Stats stats = demod.stats();
         st_in_band_.store(in_band, std::memory_order_relaxed);
-        st_searching_.store(searching, std::memory_order_relaxed);
+        if (!searching)
+            st_settled_serial_.store(p.tune_serial, std::memory_order_release);
         st_squelch_open_.store(in_band && !searching && stats.squelch_open, std::memory_order_relaxed);
         st_level_.store(in_band ? stats.level_dbfs : -200.0f, std::memory_order_relaxed);
         st_audio_rms_.store(in_band && !searching ? stats.audio_rms : 0.0f, std::memory_order_relaxed);

@@ -65,6 +65,7 @@ add_library(spectro_core STATIC
     src/radio/file_source.cpp
     src/radio/acquisition.cpp
     src/audio/listener.cpp
+    src/audio/scanner.cpp
     src/app/options.cpp
     src/app/pipeline.cpp)
 target_include_directories(spectro_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -142,7 +143,8 @@ if(SPECTRO_BUILD_TESTS)
         tests/test_units.cpp
         tests/test_spectrum.cpp
         tests/test_sources.cpp
-        tests/test_audio.cpp)
+        tests/test_audio.cpp
+        tests/test_scanner.cpp)
     target_link_libraries(spectro_tests PRIVATE spectro_core spectro_flags)
     add_test(NAME spectro_tests COMMAND spectro_tests)
 endif()
