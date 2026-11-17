@@ -35,6 +35,9 @@ in the 3D view with the control panel, as a 2D waterfall, and as a spectrum.
   being played. The receiver finds the carrier near the click, applies the
   de-emphasis and audio filtering that the kind of FM calls for and an optional
   squelch, and keeps the audio in step with the sound card's clock.
+- **Scanning**: or let it find the signals. It stops on each one above a
+  threshold, works out whether it is narrowband or wideband FM, stays while it
+  is on the air, then moves on to the next.
 - **RTL-SDR dongles** (RTL2832U with an R820T/R828D, E4000, FC0012/13 or
   FC2580 tuner) work too, at up to 3.2 MS/s: `--source rtlsdr`.
 - **Live control** of centre frequency, gain, FFT size (256 to 262 144), window,
@@ -107,6 +110,7 @@ either, the simulator and file playback still work.
 ./build/spectrogram --source sim --listen 2431.4M  # ... and listen to its FM voice channel
 ./build/spectrogram --source rtlsdr --freq 162.475M --listen 162.425M --listen-bw 16k   # NOAA weather radio
 ./build/spectrogram --source rtlsdr --freq 100M --listen 100.3M --listen-bw 200k        # an FM broadcast station
+./build/spectrogram --source rtlsdr --freq 462M --scan                                   # scan for signals
 ./build/spectrogram --file capture.sc16 --rate 20M --freq 2.437G
 ```
 
@@ -127,6 +131,7 @@ option; the most useful ones:
 | `--listen HZ`, `--listen-bw HZ` | Play the FM signal at this frequency, in a channel this wide: 5k to 25k is narrowband FM (default 12.5k), 100k to 300k wideband |
 | `--deemphasis 75\|50` | Wideband FM de-emphasis in µs: 75 (the Americas, South Korea; default) or 50 (elsewhere) |
 | `--volume PCT`, `--squelch DB` | Audio volume (default 50) and squelch threshold in dBFS (default off) |
+| `--scan`, `--scan-threshold DB`, `--scan-hang SEC` | Listen by scanning; the level a signal must reach (default: 15 dB above the noise) and how long to wait when it stops (default 2 s) |
 | `--headless --duration SEC` | No window: print stream statistics (see below) |
 
 File playback understands `sc16` (the bladeRF's own format, as written by
@@ -154,8 +159,9 @@ bladeRF:
 
 ### Listening to FM
 
-Hold Ctrl and click a signal in the plot to hear it; `L` turns the sound on and
-off. A box marks the channel being played. It is as wide as the channel
+`L` turns the sound on and off. It starts by scanning for signals (see below);
+hold Ctrl and click a signal in the plot to hear that one instead. A box marks
+the channel being played. It is as wide as the channel
 filter, as deep as the history and as tall as the level scale. It is bright
 while there is something to hear and dim while the squelch mutes it. A small
 window next to the plot sets the frequency, the channel width, the volume and
@@ -192,6 +198,36 @@ the squelch.
   sample rate above it (2444.6 MHz); it is only on air at sample rates of
   2 MS/s and up.
 
+#### Scanning
+
+With scanning on (`S`, or the check box in the listening window), the
+scanner looks for signals itself:
+
+- **What counts as a signal**: a stretch of the spectrum standing clear of the
+  noise floor whose peak reaches the threshold, for at least 60 ms. The
+  threshold is a level on the plot's scale, drawn as an amber plane through
+  the plot; whatever pokes through it is a candidate, marked in amber along
+  the front edge. It starts 15 dB above the noise floor; set it in the window
+  or with `--scan-threshold`. Wideband stations spread their power over many
+  columns and peak lower than a narrowband signal of the same power, so lower
+  the threshold to catch weaker ones.
+- **Narrowband or wideband**: told from the signal's width. Anything over
+  60 kHz wide is a broadcast station and gets a 200 kHz wideband channel; the
+  rest get a 12.5, 16 or 25 kHz narrowband channel to suit. Stretches wider
+  than 350 kHz (data bursts, Wi-Fi) are not FM and are left alone, as are
+  signals too close to the band edge for their channel to fit.
+- **Staying and moving on**: the scanner stays while the signal stays above
+  the threshold. When it drops below, the sound is muted and the scanner
+  waits for the hang time (2 s; set it in the window or with `--scan-hang`) in
+  case it comes back, as conversations pause between overs. Then it goes on
+  to the next signal up in frequency, wrapping around at the top of the band.
+- **Skipping**: `N` (or "Skip") moves on at once and leaves that signal out
+  from then on, e.g. a steady carrier or an interference spur, which would
+  otherwise hold the scanner for good.
+- Ctrl + click or a typed frequency picks a channel and ends scanning; `S`
+  ends it and stays on the current channel. Each signal the scanner stops on
+  is logged in the terminal.
+
 ### Controls
 
 | Input | Action |
@@ -202,7 +238,9 @@ the squelch.
 | Double click, `R` | Reset the view |
 | Ctrl + click | Listen to the signal under the cursor (FM) |
 | Ctrl + drag | Slide the channel being listened to |
-| `L` | Sound on / off |
+| `L` | Sound on / off (it starts by scanning for signals) |
+| `S` | Scanning on / off |
+| `N` | Skip to the next signal while scanning |
 | `1` / `2` / `3` | 3D view / top view (2D waterfall) / front view (spectrum) |
 | `←` / `→` | Tune down / up by 1/20 of the span (Shift: 1/200, Ctrl: half the span) |
 | `↑` / `↓` | Gain up / down (Shift: 5 dB steps) |
@@ -252,8 +290,9 @@ strongest signal once per second, and a summary at the end.
 ./build/spectrogram --self-test                   # add --source sim to test without the radio
 ```
 
-runs a 15-second scripted tour (views, window sizes, FFT sizes, retuning,
-pausing, cursor readout, listening to a narrowband and a wideband FM signal)
+runs an 18-second scripted tour (views, window sizes, FFT sizes, retuning,
+pausing, cursor readout, listening to a narrowband and a wideband FM signal,
+scanning)
 and reports `Self-test PASSED` or `FAILED`. The listening part is silent
 unless `--volume` is given. Add `--validate` to run it under the Vulkan
 validation layers if they are installed (`vulkan-validationlayers`).
@@ -297,7 +336,9 @@ ctest --test-dir build --output-on-failure        # unit tests
   followed by de-emphasis and a 15 kHz low-pass that also brings the rate down
   to 48 kHz. The resampler's rate is trimmed to keep the amount of audio
   waiting for the sound card steady, which absorbs the difference between the
-  radio's clock and the sound card's.
+  radio's clock and the sound card's. The scanner (`src/audio/scanner.cpp`)
+  needs no signal processing of its own: it reads the spectrogram rows on
+  their way to the display and steers the listener.
 - **Renderer** (`src/gfx/`, `shaders/`). The spectrogram lives in a single
   float texture used as a ring buffer: one texel per frequency bin and row,
   holding dBFS. There is no vertex buffer; the vertex shader derives the grid
@@ -317,7 +358,7 @@ Only core Vulkan 1.0 is used, with no optional device features.
 ```
 src/radio/    IqSource interface; bladeRF, RTL-SDR, simulator and file sources; receive thread
 src/dsp/      windows, SpectrumEngine (FFT, averaging, rows), FM demodulator (narrowband and wideband)
-src/audio/    listening: audio thread, audio FIFO, rate matching, sound output
+src/audio/    listening: audio thread, audio FIFO, rate matching, sound output, scanner
 src/gfx/      Vulkan context and swapchain, renderer, camera, colour maps, PNG writer
 src/ui/       Dear ImGui integration; 3D axes, grid and labels
 src/app/      command line, pipeline wiring, the interactive application, headless mode

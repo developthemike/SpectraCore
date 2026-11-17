@@ -158,6 +158,15 @@ TEST(options_listening)
     CHECK(!parse({"--listen-bw", "2k"}, bad, error));
     CHECK(!parse({"--listen-bw", "400k"}, bad, error));
     CHECK(!parse({"--deemphasis", "60"}, bad, error));
+    CHECK(!parse({"--scan", "--listen", "98.1M"}, bad, error));  // one or the other
+    CHECK(!parse({"--scan-hang", "-1"}, bad, error));
+
+    Options scan;
+    CHECK(!scan.scan);
+    CHECK(parse({"--scan", "--scan-threshold", "-55", "--scan-hang=0.5"}, scan, error));
+    CHECK(scan.scan);
+    CHECK_NEAR(scan.scan_threshold, -55.0, 1e-12);
+    CHECK_NEAR(scan.scan_hang, 0.5, 1e-12);
     CHECK(!parse({"--volume", "150"}, bad, error));
     CHECK(!parse({"--squelch", "5"}, bad, error));
 }

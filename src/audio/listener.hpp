@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "audio/audio_fifo.hpp"
+#include "audio/scanner.hpp"
 #include "dsp/fm_demod.hpp"
 #include "radio/acquisition.hpp"
 #include "radio/iq_source.hpp"
@@ -40,7 +41,7 @@ struct ListenStatus {
     uint64_t overruns      = 0;     // times audio was discarded because the sound card fell behind
 };
 
-class Listener final : private IqTap {
+class Listener final : private IqTap, public ScanReceiver {
 public:
     static constexpr int kAudioRate = 48000;
 
@@ -82,19 +83,31 @@ public:
     void set_enabled(bool enabled);
     // Selects the channel by its absolute frequency.  With `search_hz` > 0 the
     // strongest signal within that distance is located first, and the channel
-    // centred on it: use it when the frequency is only known roughly.
-    void tune(double frequency_hz, double search_hz = 0.0);
+    // centred on it: use it when the frequency is only known roughly.  With
+    // `bandwidth_hz` > 0 the channel width changes in the same step.
+    void tune(double frequency_hz, double search_hz = 0.0, double bandwidth_hz = 0.0);
     void set_bandwidth(double hz);           // also selects narrowband or wideband FM
     void set_deemphasis(double seconds);     // wideband FM: 75e-6 or 50e-6
     void set_squelch(float threshold_dbfs);  // FmDemodulator::kSquelchOff: always open
     void set_volume(float volume);           // 0 ... 1
+    void set_muted(bool muted);              // silence without stopping (the audio keeps flowing)
 
     ListenStatus status() const;
 
     // Where the audio goes: mono, kAudioRate samples per second.
     AudioFifo& audio() { return fifo_; }
 
+    // ScanReceiver: what a Scanner drives.
+    void   scan_tune(double frequency_hz, double bandwidth_hz, double search_hz) override
+    {
+        tune(frequency_hz, search_hz, bandwidth_hz);
+    }
+    void   scan_mute(bool muted) override { set_muted(muted); }
+    double scan_frequency() const override;
+
 private:
+    static double clamp_bandwidth(double hz);
+
     struct Params {
         bool     enabled     = false;
         uint64_t session     = 0;  // counts the times listening was switched on
@@ -105,6 +118,7 @@ private:
         double   deemphasis  = FmDemodulator::kDefaultDeemphasis;
         float    squelch     = FmDemodulator::kSquelchOff;
         float    volume      = 0.5f;
+        bool     muted       = false;
     };
 
     void on_samples(const int16_t* iq, size_t samples) override;  // receive thread
@@ -130,7 +144,7 @@ private:
 
     // Status, written by the audio thread (dropped_iq_: by the receive thread).
     std::atomic<bool>     st_in_band_{false};
-    std::atomic<bool>     st_searching_{false};
+    std::atomic<uint64_t> st_settled_serial_{0};  // last tune() applied, its carrier search done
     std::atomic<bool>     st_squelch_open_{false};
     std::atomic<float>    st_level_{-200.0f};
     std::atomic<float>    st_audio_rms_{0.0f};

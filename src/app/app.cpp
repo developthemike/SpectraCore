@@ -142,6 +142,7 @@ private:
     void probe_cursor(float column_fraction, int row_depth, bool verify);
     void self_test_listen(bool wide);
     void self_test_check_audio(bool wide);
+    void self_test_scan(int stage);
     void update_cursor_readout();
     bool surface_under(float window_x, float window_y, Vec3& hit, Vec3* entry = nullptr) const;
     double frequency_at(float x) const;
@@ -152,6 +153,10 @@ private:
     // Listening
     void set_listening(bool on);
     void toggle_listening();
+    void start_scanning();
+    void stop_scanning();
+    bool scanning() const { return scanner_ && scanner_->active(); }
+    bool scan_locked() const;  // scanning and on a signal
     void listen_to(double hz, double search_hz);
     bool choose_channel_at(float window_x, float window_y, bool find_carrier);
     void update_listening();
@@ -168,6 +173,7 @@ private:
     void draw_listen_label();
     void build_lines();
     void add_listen_box(float pixel_ratio);
+    void add_scan_marks(float pixel_ratio);
     SceneParams scene_params() const;
     Mat4        view_projection() const;
     float       aspect() const;
@@ -261,7 +267,11 @@ private:
         double deemphasis = FmDemodulator::kDefaultDeemphasis;  // wideband FM, seconds
         float  volume    = 0.5f;   // 0..1
         float  squelch   = FmDemodulator::kSquelchOff;  // dBFS
+        float  scan_threshold = std::numeric_limits<float>::quiet_NaN();  // dBFS; NaN: from the noise floor
+        double scan_hang      = Scanner::kDefaultHang;
     } listen_;
+    std::unique_ptr<Scanner> scanner_;
+    Scanner::State           logged_scan_state_ = Scanner::State::Off;
     double       listen_mhz_ = 0.0;
     ListenStatus listen_status_;
     bool         choosing_ = false;  // a Ctrl + drag across the plot is in progress
@@ -382,8 +392,14 @@ App::App(const Options& options)
     listen_.volume      = static_cast<float>(volume / 100.0);
     listen_.bandwidth   = options_.listen_bandwidth;
     listen_.deemphasis  = options_.deemphasis_us * 1e-6;
+    listen_.scan_hang   = options_.scan_hang;
+    if (!std::isnan(options_.scan_threshold))
+        listen_.scan_threshold = static_cast<float>(options_.scan_threshold);
+    scanner_ = std::make_unique<Scanner>(pipeline_.listener());
     if (!std::isnan(options_.squelch))
         listen_.squelch = static_cast<float>(options_.squelch);
+    if (options_.scan)
+        start_scanning();
     if (!std::isnan(options_.listen_frequency)) {
         listen_to(options_.listen_frequency, 0.0);
         if (!listen_in_band()) {
@@ -544,6 +560,14 @@ void App::pump_rows()
             if (!info.gap) {
                 row_period_ = info.period_s;
                 fft_size_   = info.fft_size;
+            }
+
+            // The scanner sees every row, also while the display is paused.
+            if (scanning()) {
+                const IqSource&    source = pipeline_.source();
+                const SpectrumView view{source.frequency(), source.sample_rate(), columns_, info.fft_size};
+                scanner_->on_row(incoming_.data() + static_cast<size_t>(i) * static_cast<size_t>(columns_), info,
+                                 view);
             }
 
             // Rows the DSP thread had to drop leave a hole in the numbering.
@@ -812,7 +836,9 @@ void App::run_self_test(double elapsed)
         {10.0, "top view"},         {10.6, "cursor readout in the top view"},
         {11.0, "listen to a signal (Ctrl + click)"},          {11.6, "cursor readout in the 3D view"},
         {12.6, "check the audio"},  {13.0, "listen to a broadcast station (wideband FM)"},
-        {14.6, "check the wideband audio"},                   {15.0, "finish"},
+        {14.6, "check the wideband audio"},                   {15.0, "scan for signals"},
+        {16.6, "check the scanner, then skip"},               {17.8, "check the next signal"},
+        {18.2, "finish"},
     };
     constexpr int kStepCount = static_cast<int>(std::size(kSteps));
     if (self_test_step_ >= kStepCount || elapsed < kSteps[self_test_step_].at)
@@ -856,6 +882,9 @@ void App::run_self_test(double elapsed)
     case 21: self_test_check_audio(false); break;
     case 22: apply_view(ViewPreset::Top); self_test_listen(true); break;
     case 23: self_test_check_audio(true); apply_view(ViewPreset::Perspective); break;
+    case 24: self_test_scan(0); break;
+    case 25: self_test_scan(1); break;
+    case 26: self_test_scan(2); break;
     default: glfwSetWindowShouldClose(window, GLFW_TRUE); break;
     }
     ++self_test_step_;
@@ -987,6 +1016,63 @@ void App::self_test_check_audio(bool wide)
     listener.set_bandwidth(listen_.bandwidth);
 #else
     (void)wide;
+#endif
+}
+
+// Self-test: scanning.  The simulator's lowest signal above -50 dBFS is a
+// steady carrier, and the next one up its narrowband voice channel: the
+// scanner must stop on the first, classify it as narrowband, and after a skip
+// find and play the second.  On a radio there is no telling what is on the
+// air, so it only has to keep running.
+void App::self_test_scan(int stage)
+{
+#if SPECTRO_HAVE_AUDIO
+    if (!pipeline_.listener().available())
+        return;
+    const bool sim = options_.source.kind == "sim";
+    if (stage == 0) {
+        if (sim)
+            listen_.scan_threshold = -50.0f;
+        start_scanning();
+        if (!scanning()) {
+            LOG_ERROR("self-test: scanning did not start");
+            self_test_failed_ = true;
+        }
+        return;
+    }
+
+    const Scanner::Status st = scanner_->status();
+    const ListenStatus    ls = pipeline_.listener().status();
+    static const char* const kStates[] = {"off", "searching", "receiving", "holding"};
+    LOG_INFO("self-test: scanner %s; %.5f MHz, %s FM, %.0f kHz wide, peak %.1f dBFS (threshold %.0f, floor %.0f "
+             "dBFS); %zu signal(s) above the threshold; loudness %.2f",
+             kStates[static_cast<int>(st.state)], ls.frequency / 1e6, st.wide ? "wideband" : "narrowband",
+             st.occupied_hz / 1e3, static_cast<double>(st.level_dbfs), static_cast<double>(listen_.scan_threshold),
+             static_cast<double>(st.floor_dbfs), scanner_->candidates().size(), static_cast<double>(ls.audio_rms));
+
+    bool ok = scanning();
+    if (sim) {
+        const double fs       = pipeline_.source().sample_rate();
+        const double expected = options_.source.frequency + (stage == 1 ? SimSource::carriers(fs)[0].offset_hz
+                                                                        : SimSource::voice_channel(fs).offset_hz);
+        ok = ok && st.state == Scanner::State::Receiving && !st.wide && !ls.searching &&
+             std::fabs(ls.frequency - expected) < 2000.0;
+        if (ok && stage == 2) {
+            // The tune, as loud as a 1 kHz tone of the channel's nominal deviation.
+            const double loudness = SimSource::voice_channel(fs).deviation_hz / (0.4 * ls.bandwidth) / std::sqrt(2.0);
+            ok = std::fabs(ls.audio_rms - loudness) < 0.25 * loudness;
+        }
+    }
+    if (!ok) {
+        LOG_ERROR("self-test: the scanner is not where it should be");
+        self_test_failed_ = true;
+    }
+    if (stage == 1)
+        scanner_->skip();
+    else
+        set_listening(false);
+#else
+    (void)stage;
 #endif
 }
 
@@ -1254,6 +1340,16 @@ void App::handle_input()
     }
     if (pressed(ImGuiKey_L))
         toggle_listening();
+    if (pressed(ImGuiKey_S)) {
+        if (scanning()) {
+            stop_scanning();
+            toast("Scanning off: staying on this channel");
+        } else {
+            start_scanning();
+        }
+    }
+    if (pressed(ImGuiKey_N) && scanning())
+        scanner_->skip();
     if (pressed(ImGuiKey_P) || pressed(ImGuiKey_F12))
         take_screenshot({});
     if (pressed(ImGuiKey_F11) || pressed(ImGuiKey_F))
@@ -1298,6 +1394,7 @@ void App::set_listening(bool on)
 #if SPECTRO_HAVE_AUDIO
     Listener& listener = pipeline_.listener();
     if (!on) {
+        stop_scanning();
         listener.set_enabled(false);
         if (audio_)
             audio_->stop();
@@ -1329,23 +1426,56 @@ void App::set_listening(bool on)
 #endif
 }
 
-// The L key and the "Listen" check box.  Turning the audio on resumes the last
-// channel, or starts in the middle of the band if there is none in it.
+// The L key and the "Listen" check box.  Turning the audio on starts scanning
+// for signals; Ctrl + click chooses one instead.
 void App::toggle_listening()
 {
-    if (listen_.on || (listen_.selected && listen_in_band())) {
-        set_listening(!listen_.on);
+    if (listen_.on)
+        set_listening(false);
+    else
+        start_scanning();
+}
+
+// Listens by scanning: the scanner finds the signals, the listener plays them.
+void App::start_scanning()
+{
+    if (scanning())
+        return;
+    // Without a threshold the scanner waits until it knows the noise floor
+    // (see update_listening()), and takes nothing before.
+    constexpr float kNothingYet = 1e9f;
+    scanner_->set_threshold(std::isnan(listen_.scan_threshold) ? kNothingYet : listen_.scan_threshold);
+    scanner_->set_hang(listen_.scan_hang);
+    scanner_->start();  // mutes the listener until it finds something
+    set_listening(true);
+    if (!listen_.on) {
+        scanner_->stop();
         return;
     }
-    listen_to(pipeline_.source().frequency(), 0.0);
-    if (listen_.on)
-        toast("Ctrl + click a signal to listen to it");
+    listen_.selected = true;
+    toast("Scanning for signals (S: stop, N: next)");
+}
+
+void App::stop_scanning()
+{
+    if (scanner_)
+        scanner_->stop();  // the listener stays where it is
+}
+
+bool App::scan_locked() const
+{
+    if (!scanning())
+        return false;
+    const Scanner::State state = scanner_->status().state;
+    return state == Scanner::State::Receiving || state == Scanner::State::Holding;
 }
 
 // Selects the channel to listen to and turns the audio on.  With `search_hz`
 // the receiver looks for the carrier that far around `hz` and centres on it.
+// Choosing a channel ends scanning.
 void App::listen_to(double hz, double search_hz)
 {
+    stop_scanning();
     listen_.selected  = true;
     listen_.frequency = hz;
     listen_mhz_       = hz / 1e6;
@@ -1376,8 +1506,34 @@ bool App::choose_channel_at(float window_x, float window_y, bool find_carrier)
 void App::update_listening()
 {
     listen_status_ = pipeline_.listener().status();
-    if (listen_.on)
+    if (listen_.on) {
         listen_.frequency = listen_status_.frequency;  // a search moves it onto the carrier
+        if (scanning())
+            listen_.bandwidth = listen_status_.bandwidth;  // the scanner chose it
+    }
+    if (scanning()) {
+        // A log of what the scanner stops on.
+        const Scanner::Status scan = scanner_->status();
+        if (scan.state == Scanner::State::Receiving && logged_scan_state_ == Scanner::State::Searching) {
+            LOG_INFO("Scanner: %s FM at %.5f MHz (%.0f kHz wide, peak %.1f dBFS)",
+                     scan.wide ? "wideband" : "narrowband", scan.frequency / 1e6, scan.occupied_hz / 1e3,
+                     static_cast<double>(scan.level_dbfs));
+        } else if (scan.state == Scanner::State::Searching && (logged_scan_state_ == Scanner::State::Receiving ||
+                                                               logged_scan_state_ == Scanner::State::Holding)) {
+            LOG_INFO("Scanner: moving on from %.5f MHz", scan.frequency / 1e6);
+        }
+        logged_scan_state_ = scan.state;
+    } else {
+        logged_scan_state_ = Scanner::State::Off;
+    }
+    if (scanning() && std::isnan(listen_.scan_threshold)) {
+        // No threshold given: some way above the noise, once that is known.
+        const Scanner::Status scan = scanner_->status();
+        if (!scan.warming_up && scan.floor_dbfs > -190.0f) {
+            listen_.scan_threshold = std::round(scan.floor_dbfs + Scanner::kDefaultThresholdAboveFloor);
+            scanner_->set_threshold(listen_.scan_threshold);
+        }
+    }
 }
 
 // Whether the channel lies inside the band being received (and displayed).
@@ -1403,7 +1559,7 @@ bool App::listen_wide() const
 // is bright while there is something to hear and dim while the squelch mutes.
 void App::add_listen_box(float pixel_ratio)
 {
-    if (!listen_.on)
+    if (!listen_.on || (scanning() && !scan_locked()))
         return;
     const IqSource& source = pipeline_.source();
     const double    span   = source.sample_rate();
@@ -1421,7 +1577,8 @@ void App::add_listen_box(float pixel_ratio)
     const float z1  = -0.5f * view_.plot_depth - eps;
     const float y0  = 0.0f, y1 = view_.plot_height;
 
-    const bool     audible = listen_in_band() && listen_status_.squelch_open;
+    const bool audible = listen_in_band() && listen_status_.squelch_open &&
+                         (!scanning() || scanner_->status().state == Scanner::State::Receiving);
     const uint32_t color   = audible ? pack_rgba(110, 255, 190, 255) : pack_rgba(150, 200, 180, 190);
     const float    width   = (audible ? 1.8f : 1.3f) * pixel_ratio;
     const auto     edge    = [&](Vec3 a, Vec3 b) {
@@ -1449,10 +1606,63 @@ void App::add_listen_box(float pixel_ratio)
     }
 }
 
+// While scanning: the threshold as a plane through the plot, so that the
+// signals poking through it are the ones the scanner will take, and a bar
+// under each of them along the front edge.
+void App::add_scan_marks(float pixel_ratio)
+{
+    if (!scanning() || std::isnan(listen_.scan_threshold))
+        return;
+    const float span = view_.db_ceiling - view_.db_floor;
+    const float level = (listen_.scan_threshold - view_.db_floor) / std::max(span, 1e-3f);
+    if (level < 0.0f || level > 1.0f)
+        return;  // off the level scale
+
+    const auto add = [&](Vec3 a, Vec3 b, uint32_t color, float width) {
+        LineInstance line{};
+        line.start[0]   = a.x;
+        line.start[1]   = a.y;
+        line.start[2]   = a.z;
+        line.width      = width;
+        line.end[0]     = b.x;
+        line.end[1]     = b.y;
+        line.end[2]     = b.z;
+        line.depth_bias = 1e-4f;
+        line.color      = color;
+        lines_.push_back(line);
+    };
+    const float    eps   = 0.003f * kPlotWidth;
+    const float    y     = level * view_.plot_height;
+    const float    xl    = -0.5f * kPlotWidth - eps, xr = 0.5f * kPlotWidth + eps;
+    const float    zf    = 0.5f * view_.plot_depth + eps, zb = -0.5f * view_.plot_depth - eps;
+    const uint32_t plane = pack_rgba(255, 190, 80, 150);
+    add({xl, y, zf}, {xr, y, zf}, plane, 1.2f * pixel_ratio);
+    add({xl, y, zb}, {xr, y, zb}, plane, 1.0f * pixel_ratio);
+    add({xl, y, zf}, {xl, y, zb}, plane, 1.0f * pixel_ratio);
+    add({xr, y, zf}, {xr, y, zb}, plane, 1.0f * pixel_ratio);
+
+    const IqSource& source = pipeline_.source();
+    const auto      x_of   = [&](double hz) {
+        const double f = std::clamp((hz - source.frequency()) / source.sample_rate(), -0.5, 0.5);
+        return static_cast<float>(f) * kPlotWidth;
+    };
+    for (const DetectedSignal& s : scanner_->candidates()) {
+        // At least a few pixels wide, so that narrow signals show too.
+        float x0 = x_of(s.low_hz), x1 = x_of(s.high_hz);
+        const float min_width = 0.004f * kPlotWidth;
+        if (x1 - x0 < min_width) {
+            const float mid = 0.5f * (x0 + x1);
+            x0 = mid - 0.5f * min_width;
+            x1 = mid + 0.5f * min_width;
+        }
+        add({x0, 0.0f, zf}, {x1, 0.0f, zf}, pack_rgba(255, 190, 80, 235), 3.0f * pixel_ratio);
+    }
+}
+
 // Names the box: the frequency being played, above its front edge.
 void App::draw_listen_label()
 {
-    if (!listen_.on || !view_.labels)
+    if (!listen_.on || !view_.labels || (scanning() && !scan_locked()))
         return;
     const IqSource& source = pipeline_.source();
     const double    center = (listen_.frequency - source.frequency()) / source.sample_rate();
@@ -1467,7 +1677,8 @@ void App::draw_listen_label()
 
     char text[64];
     std::snprintf(text, sizeof(text), "%s %.5f MHz", listen_wide() ? "WFM" : "NFM", listen_.frequency / 1e6);
-    const bool   audible = listen_in_band() && listen_status_.squelch_open;
+    const bool   audible = listen_in_band() && listen_status_.squelch_open &&
+                         (!scanning() || scanner_->status().state == Scanner::State::Receiving);
     const ImVec2 size    = ImGui::CalcTextSize(text);
     const float  line    = ImGui::GetFontSize();
     const ImVec2 pad(0.45f * line, 0.2f * line);
@@ -1681,8 +1892,8 @@ void App::draw_panel()
     if (ImGui::Checkbox("Listen", &listening))
         toggle_listening();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Play the FM audio of one channel, narrowband or wideband (L).\n"
-                          "Ctrl + click a signal in the plot to choose it.");
+        ImGui::SetTooltip("Play FM audio, narrowband or wideband (L).  It scans for signals\n"
+                          "above a threshold; Ctrl + click a signal in the plot to choose one.");
 #endif
 
     ImGui::PopItemWidth();
@@ -1712,6 +1923,70 @@ void App::draw_listen_window()
     if (ImGui::Begin(wide ? "Listen: wideband FM###listen" : "Listen: narrowband FM###listen", &open,
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::PushItemWidth(-80.0f * scale);
+
+        // ---- Scanning ----
+        bool scan = scanning();
+        if (ImGui::Checkbox("Scan for signals (S)", &scan)) {
+            if (scan)
+                start_scanning();
+            else
+                stop_scanning();
+        }
+        if (scanning()) {
+            const Scanner::Status st = scanner_->status();
+            const ImVec4 green(0.45f, 0.85f, 0.55f, 1.0f), amber(1.0f, 0.75f, 0.3f, 1.0f);
+            switch (st.state) {
+            case Scanner::State::Searching:
+                if (st.warming_up || std::isnan(listen_.scan_threshold))
+                    ImGui::TextDisabled("Looking at the spectrum...");
+                else
+                    ImGui::TextColored(amber, "Searching: %zu signal(s) above the threshold",
+                                       scanner_->candidates().size());
+                break;
+            case Scanner::State::Receiving:
+                ImGui::TextColored(green, "Receiving %s FM, %.0f kHz wide", st.wide ? "wideband" : "narrowband",
+                                   st.occupied_hz / 1e3);
+                break;
+            case Scanner::State::Holding:
+                ImGui::TextColored(amber, "Signal gone: moving on in %.1f s", st.hold_left);
+                break;
+            case Scanner::State::Off:
+                break;
+            }
+
+            float threshold = std::isnan(listen_.scan_threshold) ? -60.0f : listen_.scan_threshold;
+            ImGui::BeginDisabled(std::isnan(listen_.scan_threshold));
+            if (ImGui::SliderFloat("Threshold", &threshold, -160.0f, 0.0f, "%.0f dBFS", ImGuiSliderFlags_AlwaysClamp)) {
+                listen_.scan_threshold = threshold;
+                scanner_->set_threshold(threshold);
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("A signal's peak on the plot must reach this level (the amber plane).\n"
+                                  "Noise floor: %.0f dBFS", static_cast<double>(st.floor_dbfs));
+            float hang = static_cast<float>(listen_.scan_hang);
+            if (ImGui::SliderFloat("Hang", &hang, 0.0f, 10.0f, "%.1f s", ImGuiSliderFlags_AlwaysClamp)) {
+                listen_.scan_hang = hang;
+                scanner_->set_hang(hang);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How long to wait for a signal that has stopped before moving on");
+
+            ImGui::BeginDisabled(!scan_locked());
+            if (ImGui::Button("Skip (N)"))
+                scanner_->skip();
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Move on, and leave this signal out from now on");
+            if (scanner_->lockouts() > 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%zu skipped", scanner_->lockouts());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear"))
+                    scanner_->clear_lockouts();
+            }
+            ImGui::Separator();
+        }
 
         // Typed frequencies are taken literally; the step buttons move by
         // 500 Hz, or by a 12.5 kHz channel with Ctrl held.
@@ -1768,7 +2043,9 @@ void App::draw_listen_window()
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Mute the audio while the channel is below this level");
 
-        if (!listen_in_band()) {
+        if (scanning() && !scan_locked()) {
+            // Nothing to report until the scanner finds something.
+        } else if (!listen_in_band()) {
             ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f), "Outside the received band");
         } else {
             ImGui::Text("Level  %.1f dBFS", static_cast<double>(listen_status_.level_dbfs));
@@ -1838,8 +2115,10 @@ void App::draw_status()
                                static_cast<unsigned long long>(lost));
         else
             ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1.0f), "  no samples lost");
-        if (listen_.on)
-            ImGui::Text("Audio %.5f MHz", listen_.frequency / 1e6);
+        if (listen_.on && scanning() && !scan_locked())
+            ImGui::TextUnformatted("Audio: scanning for signals");
+        else if (listen_.on)
+            ImGui::Text("Audio %.5f MHz%s", listen_.frequency / 1e6, scanning() ? "  (scanning)" : "");
         if (view_.paused)
             ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "PAUSED (Space to resume)");
         if (!view_.show_panel)
@@ -1884,7 +2163,9 @@ void App::draw_help()
             {"Mouse wheel", "Zoom"},
             {"Double click, R", "Reset the view"},
             {"Ctrl + click or drag", "Listen to the signal under the cursor (FM)"},
-            {"L", "Audio on / off"},
+            {"L", "Audio on / off (scans for signals)"},
+            {"S", "Scanning on / off"},
+            {"N", "Skip to the next signal while scanning"},
             {"1 / 2 / 3", "3D view / top view (2D waterfall) / front view (spectrum)"},
             {"Left / Right", "Tune down / up (Shift: fine, Ctrl: half the span)"},
             {"Up / Down", "Gain up / down (Shift: 5 dB steps)"},
@@ -2023,6 +2304,7 @@ void App::build_lines()
     axes.show_grid       = view_.grid;
     build_axes(axes, lines_, labels_);
     add_listen_box(pixel_ratio);
+    add_scan_marks(pixel_ratio);
 
     // Spectrum traces along the front edge of the plot.
     if (!have_row_)

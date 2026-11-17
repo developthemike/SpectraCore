@@ -16,8 +16,8 @@ namespace spectro {
 
 int run_headless(const Options& options)
 {
-    if (!std::isnan(options.listen_frequency))
-        LOG_WARN("--listen plays audio only in the window, not in --headless mode");
+    if (!std::isnan(options.listen_frequency) || options.scan)
+        LOG_WARN("--listen and --scan play audio only in the window, not in --headless mode");
 
     Pipeline pipeline(options);
     try {
