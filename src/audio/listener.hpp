@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "audio/audio_fifo.hpp"
+#include "audio/audio_scope.hpp"
 #include "audio/scanner.hpp"
 #include "dsp/fm_demod.hpp"
 #include "radio/acquisition.hpp"
@@ -96,6 +97,8 @@ public:
 
     // Where the audio goes: mono, kAudioRate samples per second.
     AudioFifo& audio() { return fifo_; }
+    // The last seconds of it as played, before the volume control: for a plot.
+    const AudioScope& scope() const { return scope_; }
 
     // ScanReceiver: what a Scanner drives.
     void   scan_tune(double frequency_hz, double bandwidth_hz, double search_hz) override
@@ -130,8 +133,9 @@ private:
     const double sample_rate_;
     const bool   available_;
 
-    IqRing    ring_;  // samples on their way to the audio thread
-    AudioFifo fifo_;
+    IqRing     ring_;  // samples on their way to the audio thread
+    AudioFifo  fifo_;
+    AudioScope scope_;
 
     mutable std::mutex    params_mutex_;
     Params                params_;

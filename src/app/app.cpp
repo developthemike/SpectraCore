@@ -51,6 +51,12 @@ constexpr double kNarrowWidthsHz[] = {8e3, 10e3, 12.5e3, 16e3, 20e3, 25e3};
 constexpr double kWideWidthsHz[]   = {100e3, 150e3, 200e3, 250e3};
 constexpr float  kSquelchSliderOff = -120.0f;
 
+// The audio plot: the spans on offer, and how far back to look for a zero
+// crossing to steady the short ones on.
+constexpr double      kScopeSpans[]        = {0.02, 0.1, 1.0, 5.0};
+constexpr const char* kScopeSpanNames[]    = {"20 ms", "0.1 s", "1 s", "5 s"};
+constexpr double      kScopeTriggerSeconds = 0.02;
+
 // Automatic level scale: the noise floor sits this far above the bottom, the
 // strongest signal this far below the top.
 constexpr float kRangeFloorMargin = 10.0f;
@@ -170,6 +176,7 @@ private:
     void draw_help();
     void draw_axis_labels();
     void draw_listen_window();
+    void draw_audio_plot();
     void draw_listen_label();
     void build_lines();
     void add_listen_box(float pixel_ratio);
@@ -272,6 +279,12 @@ private:
     } listen_;
     std::unique_ptr<Scanner> scanner_;
     Scanner::State           logged_scan_state_ = Scanner::State::Off;
+
+    // The audio plot in the listening window
+    int                scope_span_       = 2;   // index into kScopeSpans
+    int                scope_shown_span_ = -1;  // what scope_lo_ / scope_hi_ hold
+    std::vector<float> scope_samples_, scope_mins_, scope_maxs_;  // read from the listener
+    std::vector<float> scope_lo_, scope_hi_;  // per pixel column; lo > hi where there is nothing
     double       listen_mhz_ = 0.0;
     ListenStatus listen_status_;
     bool         choosing_ = false;  // a Ctrl + drag across the plot is in progress
@@ -982,9 +995,19 @@ void App::self_test_check_audio(bool wide)
              1e3 * static_cast<double>(listener.audio().largest_read()) / Listener::kAudioRate,
              audio_ ? audio_->description().c_str() : "nothing");
 
+    // The audio plot shows what is played: the last half second of it must be
+    // as loud as the listener says.
+    std::vector<float> tail(static_cast<size_t>(Listener::kAudioRate / 2));
+    const size_t       plotted = listener.scope().latest(tail.data(), tail.size());
+    double             power   = 0.0;
+    for (size_t i = 0; i < plotted; ++i)
+        power += static_cast<double>(tail[i]) * tail[i];
+    const double plotted_rms = plotted > 0 ? std::sqrt(power / static_cast<double>(plotted)) : 0.0;
+
     bool ok = listen_.on && status.in_band && !status.searching && status.dropped_iq == 0 &&
               (status.mode == FmMode::Wide) == wide &&
-              status.audio_samples >= static_cast<uint64_t>(Listener::kAudioRate) / 2;
+              status.audio_samples >= static_cast<uint64_t>(Listener::kAudioRate) / 2 && plotted == tail.size() &&
+              std::fabs(plotted_rms - status.audio_rms) < 0.25 * status.audio_rms + 0.02;
     const double fs = pipeline_.source().sample_rate();
     if (ok && options_.source.kind == "sim" && (!wide || fs >= SimSource::kBroadcastMinRate)) {
         // The carrier was found, and the tune comes out as loud as it should.
@@ -2057,6 +2080,9 @@ void App::draw_listen_window()
             else
                 ImGui::TextDisabled("  squelched");
         }
+        ImGui::SeparatorText("Audio");
+        draw_audio_plot();
+
         if (listen_status_.underruns > 0 || listen_status_.dropped_iq > 0) {
             ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f), "Gaps in the audio: %llu",
                                static_cast<unsigned long long>(listen_status_.underruns));
@@ -2078,6 +2104,103 @@ void App::draw_listen_window()
     if (!open)
         set_listening(false);
 #endif
+}
+
+// A time series of the audio being played: the waveform on the short spans,
+// steadied on a rising zero crossing so that a tone stands still, and the
+// envelope - the lowest and highest value per pixel - on the long ones.  It
+// shows the audio before the volume control, so +/-1 is always full scale,
+// and it freezes while the display is paused.
+void App::draw_audio_plot()
+{
+    const AudioScope& scope = pipeline_.listener().scope();
+    const float       scale = imgui_->ui_scale();
+
+    for (int i = 0; i < static_cast<int>(std::size(kScopeSpans)); ++i) {
+        if (i > 0)
+            ImGui::SameLine();
+        ImGui::RadioButton(kScopeSpanNames[i], &scope_span_, i);
+    }
+
+    const float  width  = std::max(ImGui::GetContentRegionAvail().x, 50.0f);
+    const float  height = 84.0f * scale;
+    const ImVec2 p0     = ImGui::GetCursorScreenPos();
+    const ImVec2 p1(p0.x + width, p0.y + height);
+    ImGui::InvisibleButton("##audio plot", ImVec2(width, height));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The audio as played, before the volume control.\n+/-1 is full-scale deviation.");
+
+    // Read what the plot needs: per pixel column, the lowest and highest value.
+    const int columns = std::max(1, static_cast<int>(width));
+    if (!view_.paused || static_cast<int>(scope_lo_.size()) != columns || scope_shown_span_ != scope_span_) {
+        scope_shown_span_ = scope_span_;
+        scope_lo_.assign(static_cast<size_t>(columns), std::numeric_limits<float>::infinity());
+        scope_hi_.assign(static_cast<size_t>(columns), -std::numeric_limits<float>::infinity());
+        const auto put = [&](double age, double span, float lo, float hi) {  // age: 0 = newest .. span
+            const int c = columns - 1 - static_cast<int>(age / span * columns);
+            if (c < 0)
+                return;
+            scope_lo_[static_cast<size_t>(c)] = std::min(scope_lo_[static_cast<size_t>(c)], lo);
+            scope_hi_[static_cast<size_t>(c)] = std::max(scope_hi_[static_cast<size_t>(c)], hi);
+        };
+
+        const double rate = Listener::kAudioRate;
+        const double span = kScopeSpans[scope_span_];
+        if (span <= 0.1) {
+            const size_t want    = static_cast<size_t>(std::llround(span * rate));
+            const size_t trigger = static_cast<size_t>(std::llround(kScopeTriggerSeconds * rate));
+            scope_samples_.resize(want + trigger);
+            const size_t got = scope.latest(scope_samples_.data(), want + trigger);
+            // End on the latest rising zero crossing, if there is one recently.
+            size_t end = got;
+            for (size_t i = got; i-- > 1 && i + trigger > got;) {
+                if (scope_samples_[i - 1] < 0.0f && scope_samples_[i] >= 0.0f) {
+                    if (i >= want)
+                        end = i;
+                    break;
+                }
+            }
+            for (size_t j = end > want ? end - want : 0; j < end; ++j)
+                put(static_cast<double>(end - 1 - j), static_cast<double>(want), scope_samples_[j], scope_samples_[j]);
+        } else {
+            const size_t want = static_cast<size_t>(std::llround(span * rate / AudioScope::kBlock));
+            scope_mins_.resize(want);
+            scope_maxs_.resize(want);
+            const size_t got = scope.latest_blocks(scope_mins_.data(), scope_maxs_.data(), want);
+            for (size_t k = 0; k < got; ++k)
+                put(static_cast<double>(got - 1 - k), static_cast<double>(want), scope_mins_[k], scope_maxs_[k]);
+        }
+    }
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const float mid  = 0.5f * (p0.y + p1.y);
+    const float half = 0.5f * height - 2.0f * scale;
+    draw->AddRectFilled(p0, p1, IM_COL32(9, 13, 18, 255), 3.0f * scale);
+    draw->AddLine(ImVec2(p0.x, mid - 0.5f * half), ImVec2(p1.x, mid - 0.5f * half), IM_COL32(255, 255, 255, 18));
+    draw->AddLine(ImVec2(p0.x, mid + 0.5f * half), ImVec2(p1.x, mid + 0.5f * half), IM_COL32(255, 255, 255, 18));
+    draw->AddLine(ImVec2(p0.x, mid), ImVec2(p1.x, mid), IM_COL32(255, 255, 255, 40));
+
+    const bool  audible = listen_in_band() && listen_status_.squelch_open &&
+                          (!scanning() || scanner_->status().state == Scanner::State::Receiving);
+    const ImU32 color   = audible ? IM_COL32(110, 255, 190, 255) : IM_COL32(140, 160, 170, 200);
+    for (int c = 0; c < columns; ++c) {
+        const float lo = scope_lo_[static_cast<size_t>(c)], hi = scope_hi_[static_cast<size_t>(c)];
+        if (lo > hi)
+            continue;  // nothing here (yet)
+        const float top    = mid - std::clamp(hi, -1.0f, 1.0f) * half;
+        const float bottom = mid - std::clamp(lo, -1.0f, 1.0f) * half;
+        const float x      = p0.x + static_cast<float>(c);
+        draw->AddRectFilled(ImVec2(x, top), ImVec2(x + 1.0f, std::max(bottom, top + 1.0f)), color);
+    }
+    draw->AddRect(p0, p1, IM_COL32(255, 255, 255, 40), 3.0f * scale);
+
+    // The span, on a backing so that it stays legible over loud audio.
+    const char*  label = view_.paused ? "paused" : kScopeSpanNames[scope_span_];
+    const ImVec2 size  = ImGui::CalcTextSize(label);
+    const ImVec2 at(p1.x - size.x - 5.0f * scale, p1.y - size.y - 3.0f * scale);
+    draw->AddRectFilled(ImVec2(at.x - 3.0f * scale, at.y - 1.0f * scale), ImVec2(p1.x - 2.0f * scale, p1.y - 2.0f * scale),
+                        IM_COL32(9, 13, 18, 220), 2.0f * scale);
+    draw->AddText(at, IM_COL32(170, 180, 195, 255), label);
 }
 
 void App::draw_status()

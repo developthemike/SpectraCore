@@ -165,7 +165,9 @@ the channel being played. It is as wide as the channel
 filter, as deep as the history and as tall as the level scale. It is bright
 while there is something to hear and dim while the squelch mutes it. A small
 window next to the plot sets the frequency, the channel width, the volume and
-the squelch.
+the squelch. It also plots the audio being played as a time series, before
+the volume control: the waveform over 20 or 100 ms, or how loud it has been
+over the last 1 or 5 s.
 
 - **A click finds the carrier.** One column of the display often spans more
   than a channel (10 kHz at 20 MS/s), and a hand is not much more precise. So

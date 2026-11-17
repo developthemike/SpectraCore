@@ -299,6 +299,7 @@ void Listener::run()
 
         // 4. Volume, then into the FIFO at a rate that keeps its fill level steady.
         if (!audio.empty()) {
+            scope_.write(audio.data(), audio.size(), p.muted);
             const float target_gain = p.muted ? 0.0f : p.volume * p.volume;
             for (float& v : audio) {
                 gain += kGainSmoothing * (target_gain - gain);
