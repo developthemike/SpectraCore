@@ -507,6 +507,8 @@ void FmDemodulator::reset()
     prev_re_ = prev_im_ = 0.0f;
     freq_sum_   = 0.0;
     freq_count_ = 0;
+    analysis_sum_   = 0.0;
+    analysis_count_ = 0;
     deemph_state_ = 0.0f;
     for (Biquad& section : highpass_)
         section.clear();
@@ -548,8 +550,9 @@ FmDemodulator::FrequencyEstimate FmDemodulator::take_frequency_estimate()
     return e;
 }
 
-void FmDemodulator::process(const int16_t* iq, size_t samples, std::vector<float>& audio)
+void FmDemodulator::process(const int16_t* iq, size_t samples, std::vector<float>& audio, Analysis* analysis)
 {
+    analysis_ = analysis;
     const size_t len  = shift_len_;
     const size_t step = static_cast<size_t>(decimation_);
 
@@ -584,6 +587,7 @@ void FmDemodulator::process(const int16_t* iq, size_t samples, std::vector<float
 
         resample_and_demodulate(audio);
     }
+    analysis_ = nullptr;
 }
 
 // Stages 2 to 4, for everything stage 1 has delivered so far.
@@ -637,6 +641,15 @@ void FmDemodulator::discriminate(float re, float im, std::vector<float>& audio)
     const float hz = std::atan2(cross, dot_product) * hz_per_radian_;
     freq_sum_ += static_cast<double>(hz);
     ++freq_count_;
+    if (analysis_) {
+        analysis_sum_ += static_cast<double>(hz);
+        if (++analysis_count_ >= disc_factor_) {
+            analysis_->frequency.push_back(static_cast<float>(analysis_sum_ / disc_factor_));
+            analysis_->power.push_back(re * re + im * im);
+            analysis_sum_   = 0.0;
+            analysis_count_ = 0;
+        }
+    }
 
     // Stage 4.
     const float a = hz * audio_per_hz_;

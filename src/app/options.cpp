@@ -262,6 +262,22 @@ std::vector<Flag> make_flags(Options& o, Given& given)
             }
             return true;
         });
+    add("--dmr-only", nullptr, "Play only DMR voice; scanning, move on from anything else",
+        [&o](const std::string&, std::string&) { o.dmr_only = true; return true; });
+    add("--p25-only", nullptr, "Play only P25 voice (Phase 1 and 2); scanning, move on from anything else",
+        [&o](const std::string&, std::string&) { o.p25_only = true; return true; });
+    add("--follow-calls", nullptr, "On a P25 control channel, follow each call it grants to its voice channel and back",
+        [&o](const std::string&, std::string&) { o.follow_calls = true; return true; });
+    add("--dmr-hold", "SEC", "DMR/P25 only, scanning: how long to wait on a channel for a call (default 5)",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_number(v, o.dmr_hold, e, "time"))
+                return false;
+            if (!(o.dmr_hold >= 0.5 && o.dmr_hold <= 600.0)) {
+                e = "the DMR hold time must be between 0.5 and 600 seconds";
+                return false;
+            }
+            return true;
+        });
     add("--squelch", "DB", "Mute the audio while the channel is below this level in dBFS (default: off)",
         [&o](const std::string& v, std::string& e) {
             if (!parse_number(v, o.squelch, e, "level"))

@@ -39,6 +39,10 @@ struct Options {
     bool   scan             = false;   // listen by scanning for signals
     double scan_threshold   = std::numeric_limits<double>::quiet_NaN();  // dBFS; NaN = from the noise floor
     double scan_hang        = 2.0;     // seconds
+    bool   dmr_only         = false;   // play only DMR voice; scanning, stay only for it
+    bool   p25_only         = false;   // likewise P25, Phase 1 and 2 (with both: both)
+    bool   follow_calls     = false;   // on a P25 control channel, follow the calls it grants
+    double dmr_hold         = 5.0;     // seconds a scan waits on a DMR channel for a call
 
     // Diagnostics and automation
     bool        list_gpus        = false;

@@ -20,6 +20,7 @@ option(SPECTRO_BUILD_GUI     "Build the Vulkan user interface (OFF: headless dia
 option(SPECTRO_WITH_BLADERF  "Support bladeRF hardware (OFF: simulator and file playback only)" ON)
 option(SPECTRO_WITH_RTLSDR   "Support RTL-SDR dongles, if librtlsdr is installed" ON)
 option(SPECTRO_WITH_AUDIO    "Play FM audio (needs the user interface; fetches miniaudio)" ON)
+option(SPECTRO_WITH_MBELIB   "Decode DMR voice with mbelib-neo (fetched; GPL-2.0-or-later, patented codec: see README)" OFF)
 option(SPECTRO_BUILD_TESTS   "Build the unit tests" ON)
 option(SPECTRO_NATIVE_ARCH   "Optimise for the CPU of the build machine (-march=native)" ON)
 option(SPECTRO_FETCH_MISSING "Download build dependencies that are not installed system-wide" ON)
@@ -60,12 +61,28 @@ add_library(spectro_core STATIC
     src/dsp/window.cpp
     src/dsp/spectrum_engine.cpp
     src/dsp/fm_demod.cpp
+    src/dsp/signal_classifier.cpp
+    src/dsp/fsk4_front.cpp
+    src/dsp/dmr_coding.cpp
+    src/dsp/dmr_decoder.cpp
+    src/dsp/dmr_transmitter.cpp
+    src/dsp/p25_coding.cpp
+    src/dsp/p25_decoder.cpp
+    src/dsp/p25_transmitter.cpp
+    src/dsp/p25_trunking.cpp
+    src/dsp/p25_phase2_coding.cpp
+    src/dsp/p25_phase2_decoder.cpp
+    src/dsp/p25_phase2_transmitter.cpp
+    src/dsp/ambe_vocoder.cpp
     src/radio/iq_source.cpp
     src/radio/sim_source.cpp
     src/radio/file_source.cpp
     src/radio/acquisition.cpp
     src/audio/listener.cpp
     src/audio/scanner.cpp
+    src/audio/voice_playout.cpp
+    src/audio/heard_channels.cpp
+    src/audio/trunk_follower.cpp
     src/app/options.cpp
     src/app/pipeline.cpp)
 target_include_directories(spectro_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -78,6 +95,13 @@ if(SPECTRO_HAVE_BLADERF)
     target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_BLADERF=1)
 else()
     target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_BLADERF=0)
+endif()
+
+if(SPECTRO_HAVE_MBELIB)
+    target_link_libraries(spectro_core PRIVATE spectro_mbelib)
+    target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_MBELIB=1)
+else()
+    target_compile_definitions(spectro_core PUBLIC SPECTRO_HAVE_MBELIB=0)
 endif()
 
 if(SPECTRO_HAVE_RTLSDR)
@@ -144,7 +168,12 @@ if(SPECTRO_BUILD_TESTS)
         tests/test_spectrum.cpp
         tests/test_sources.cpp
         tests/test_audio.cpp
-        tests/test_scanner.cpp)
+        tests/test_scanner.cpp
+        tests/test_classifier.cpp
+        tests/test_dmr.cpp
+        tests/test_p25.cpp
+        tests/test_p25_phase2.cpp
+        tests/test_follow.cpp)
     target_link_libraries(spectro_tests PRIVATE spectro_core spectro_flags)
     add_test(NAME spectro_tests COMMAND spectro_tests)
 endif()

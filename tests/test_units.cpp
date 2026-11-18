@@ -167,6 +167,18 @@ TEST(options_listening)
     CHECK(scan.scan);
     CHECK_NEAR(scan.scan_threshold, -55.0, 1e-12);
     CHECK_NEAR(scan.scan_hang, 0.5, 1e-12);
+    CHECK(!scan.dmr_only);
+    CHECK_NEAR(scan.dmr_hold, 5.0, 1e-12);
+    Options dmr;
+    CHECK(parse({"--scan", "--dmr-only", "--p25-only", "--dmr-hold", "12"}, dmr, error));
+    CHECK(dmr.dmr_only);
+    CHECK(dmr.p25_only);
+    CHECK_NEAR(dmr.dmr_hold, 12.0, 1e-12);
+    CHECK(!dmr.follow_calls);
+    Options follow;
+    CHECK(parse({"--follow-calls"}, follow, error));
+    CHECK(follow.follow_calls);
+    CHECK(!parse({"--dmr-hold", "0.1"}, bad, error));
     CHECK(!parse({"--volume", "150"}, bad, error));
     CHECK(!parse({"--squelch", "5"}, bad, error));
 }

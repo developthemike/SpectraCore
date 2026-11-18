@@ -20,7 +20,9 @@
 
 #include "app/pipeline.hpp"
 #include "app/signals.hpp"
+#include "audio/heard_channels.hpp"
 #include "audio/listener.hpp"
+#include "audio/trunk_follower.hpp"
 #if SPECTRO_HAVE_AUDIO
 #include "audio/audio_output.hpp"
 #endif
@@ -149,6 +151,7 @@ private:
     void self_test_listen(bool wide);
     void self_test_check_audio(bool wide);
     void self_test_scan(int stage);
+    void self_test_heard(int stage);
     void update_cursor_readout();
     bool surface_under(float window_x, float window_y, Vec3& hit, Vec3* entry = nullptr) const;
     double frequency_at(float x) const;
@@ -160,10 +163,15 @@ private:
     void set_listening(bool on);
     void toggle_listening();
     void start_scanning();
+    void skip_signal();
     void stop_scanning();
     bool scanning() const { return scanner_ && scanner_->active(); }
     bool scan_locked() const;  // scanning and on a signal
     void listen_to(double hz, double search_hz);
+    void listen_to_heard(double hz, int phase2_slot = -1);
+    void follow_to(const FollowAction& action);
+    void set_following(bool on);
+    [[maybe_unused]] void draw_heard_channels();  // only with audio
     bool choose_channel_at(float window_x, float window_y, bool find_carrier);
     void update_listening();
     bool listen_in_band() const;
@@ -176,7 +184,12 @@ private:
     void draw_help();
     void draw_axis_labels();
     void draw_listen_window();
-    void draw_audio_plot();
+    [[maybe_unused]] void draw_audio_plot();  // only with audio
+    [[maybe_unused]] void draw_dmr_status();  // likewise
+    [[maybe_unused]] void draw_p25_status();  // likewise
+    [[maybe_unused]] void draw_p25_phase2_status();  // likewise
+    [[maybe_unused]] void draw_following();  // likewise
+    std::string           digital_filter_name() const;
     void draw_listen_label();
     void build_lines();
     void add_listen_box(float pixel_ratio);
@@ -274,11 +287,24 @@ private:
         double deemphasis = FmDemodulator::kDefaultDeemphasis;  // wideband FM, seconds
         float  volume    = 0.5f;   // 0..1
         float  squelch   = FmDemodulator::kSquelchOff;  // dBFS
+        bool   dmr_only  = false;  // play DMR voice only (and scanning, stay only for it)
+        bool   p25_only  = false;  // likewise P25; with both, both
+        bool   follow    = false;  // on a P25 control channel, follow the calls it grants
+        double dmr_hold  = Scanner::kDefaultDmrHold;  // scanning, DMR/P25 only: wait for a call this long
         float  scan_threshold = std::numeric_limits<float>::quiet_NaN();  // dBFS; NaN: from the noise floor
         double scan_hang      = Scanner::kDefaultHang;
     } listen_;
     std::unique_ptr<Scanner> scanner_;
     Scanner::State           logged_scan_state_ = Scanner::State::Off;
+    std::string              logged_signal_;  // what the terminal was last told the channel carries
+    std::string              logged_dmr_[2];  // and the DMR call on each slot
+    std::string              logged_p25_;     // and the P25 call
+    std::string              logged_p25_site_;     // and a control channel's system
+    std::string              logged_p25_phases_;   // and its voice channels' kinds
+    std::vector<std::string> logged_p25_grants_;   // and its grants (the latest few)
+    HeardChannels            heard_;          // channels DMR voice has been heard on
+    TrunkFollower            follower_;       // following a P25 system's calls
+    std::string              logged_p25p2_[2];  // the P25 Phase 2 call on each slot, as logged
 
     // The audio plot in the listening window
     int                scope_span_       = 2;   // index into kScopeSpans
@@ -406,6 +432,10 @@ App::App(const Options& options)
     listen_.bandwidth   = options_.listen_bandwidth;
     listen_.deemphasis  = options_.deemphasis_us * 1e-6;
     listen_.scan_hang   = options_.scan_hang;
+    listen_.dmr_only    = options_.dmr_only;
+    listen_.p25_only    = options_.p25_only;
+    listen_.dmr_hold    = options_.dmr_hold;
+    set_following(options_.follow_calls);
     if (!std::isnan(options_.scan_threshold))
         listen_.scan_threshold = static_cast<float>(options_.scan_threshold);
     scanner_ = std::make_unique<Scanner>(pipeline_.listener());
@@ -532,6 +562,15 @@ void App::update_title()
                   format_frequency(pipeline_.source().frequency()).c_str(),
                   pipeline_.source().info().kind.c_str());
     glfwSetWindowTitle(window_.get(), title);
+}
+
+// Skipping the last signal of the list goes round again from the first.
+void App::skip_signal()
+{
+    if (scanner_ && scanner_->skip()) {
+        LOG_INFO("Scanner: end of the list, starting again from the bottom");
+        toast("End of the list: back to the first signal");
+    }
 }
 
 void App::toast(const std::string& text)
@@ -850,8 +889,9 @@ void App::run_self_test(double elapsed)
         {11.0, "listen to a signal (Ctrl + click)"},          {11.6, "cursor readout in the 3D view"},
         {12.6, "check the audio"},  {13.0, "listen to a broadcast station (wideband FM)"},
         {14.6, "check the wideband audio"},                   {15.0, "scan for signals"},
-        {16.6, "check the scanner, then skip"},               {17.8, "check the next signal"},
-        {18.2, "finish"},
+        {16.6, "check the scanner, then skip"},               {17.8, "check the next signal, then skip"},
+        {19.8, "check the digital signal"},                   {20.2, "go back to a channel DMR voice was heard on"},
+        {21.4, "check that channel"},                         {21.8, "finish"},
     };
     constexpr int kStepCount = static_cast<int>(std::size(kSteps));
     if (self_test_step_ >= kStepCount || elapsed < kSteps[self_test_step_].at)
@@ -898,6 +938,9 @@ void App::run_self_test(double elapsed)
     case 24: self_test_scan(0); break;
     case 25: self_test_scan(1); break;
     case 26: self_test_scan(2); break;
+    case 27: self_test_scan(3); break;
+    case 28: self_test_heard(0); break;
+    case 29: self_test_heard(1); break;
     default: glfwSetWindowShouldClose(window, GLFW_TRUE); break;
     }
     ++self_test_step_;
@@ -1043,10 +1086,56 @@ void App::self_test_check_audio(bool wide)
 }
 
 // Self-test: scanning.  The simulator's lowest signal above -50 dBFS is a
-// steady carrier, and the next one up its narrowband voice channel: the
-// scanner must stop on the first, classify it as narrowband, and after a skip
-// find and play the second.  On a radio there is no telling what is on the
+// steady carrier, the next one up its narrowband voice channel, and the next
+// its DMR-like digital station: the scanner must stop on the first, classify
+// it as narrowband, after a skip find and play the second, and after another
+// one find the third and recognise it as DMR.  On a radio there is no telling what is on the
 // air, so it only has to keep running.
+// Self-test helper: goes back to the first channel in the list of those DMR
+// voice was heard on, as a click on it would - with the radio tuned away
+// first, so that it has to be retuned - and then checks that it is there.
+void App::self_test_heard(int stage)
+{
+#if SPECTRO_HAVE_AUDIO
+    if (!pipeline_.listener().available())
+        return;
+    const bool sim = options_.source.kind == "sim";
+    if (heard_.channels().empty()) {
+        if (sim) {
+            LOG_ERROR("self-test: no DMR voice was heard");
+            self_test_failed_ = true;
+        } else {
+            LOG_INFO("self-test: no DMR voice heard, nothing to go back to");
+        }
+        return;
+    }
+    const HeardChannel& channel = heard_.channels().front();
+    IqSource&           source  = pipeline_.source();
+    if (stage == 0) {
+        LOG_INFO("self-test: %zu channel(s) with DMR voice; %.5f MHz: %d call(s), the last: %s",
+                 heard_.channels().size(), channel.frequency / 1e6, channel.calls, channel.last_call.c_str());
+        if (source.info().tunable)
+            tune_to(channel.frequency + source.sample_rate());  // the channel out of the band
+        listen_to_heard(channel.frequency);
+        return;
+    }
+    const ListenStatus ls = pipeline_.listener().status();
+    LOG_INFO("self-test: radio at %.5f MHz, listening to %.5f MHz (%s), DMR %s, colour code %d", source.frequency() / 1e6,
+             ls.frequency / 1e6, ls.in_band ? "in the band" : "outside the band", ls.dmr.present ? "decoded" : "not decoded",
+             ls.dmr.color_code);
+    bool ok = listen_.on && ls.in_band && std::fabs(ls.frequency - channel.frequency) < 1.0;
+    if (sim)
+        ok = ok && ls.dmr.present && ls.dmr.color_code == SimSource::kDmrColorCode;
+    if (!ok) {
+        LOG_ERROR("self-test: going back to the channel did not work");
+        self_test_failed_ = true;
+    }
+    set_listening(false);
+#else
+    (void)stage;
+#endif
+}
+
 void App::self_test_scan(int stage)
 {
 #if SPECTRO_HAVE_AUDIO
@@ -1076,10 +1165,19 @@ void App::self_test_scan(int stage)
     bool ok = scanning();
     if (sim) {
         const double fs       = pipeline_.source().sample_rate();
-        const double expected = options_.source.frequency + (stage == 1 ? SimSource::carriers(fs)[0].offset_hz
-                                                                        : SimSource::voice_channel(fs).offset_hz);
+        const double expected = options_.source.frequency + (stage == 1   ? SimSource::carriers(fs)[0].offset_hz
+                                                             : stage == 2 ? SimSource::voice_channel(fs).offset_hz
+                                                                          : SimSource::digital_stations(fs)[0].offset_hz);
         ok = ok && st.state == Scanner::State::Receiving && !st.wide && !ls.searching &&
              std::fabs(ls.frequency - expected) < 2000.0;
+        // The digital station: recognised for what it is.
+        if (ok && stage == 3) {
+            LOG_INFO("self-test: the digital station is: %s; DMR %s, colour code %d, %llu bursts decoded",
+                     describe(ls.signal).c_str(), ls.dmr.present ? "decoded" : "not decoded", ls.dmr.color_code,
+                     static_cast<unsigned long long>(ls.dmr.data_bursts + ls.dmr.voice_bursts));
+            ok = ls.signal.kind == SignalKind::Fsk4 && ls.signal.protocol == "DMR" && ls.dmr.present &&
+                 ls.dmr.repeater && ls.dmr.color_code == SimSource::kDmrColorCode;
+        }
         if (ok && stage == 2) {
             // The tune, as loud as a 1 kHz tone of the channel's nominal deviation.
             const double loudness = SimSource::voice_channel(fs).deviation_hz / (0.4 * ls.bandwidth) / std::sqrt(2.0);
@@ -1090,7 +1188,7 @@ void App::self_test_scan(int stage)
         LOG_ERROR("self-test: the scanner is not where it should be");
         self_test_failed_ = true;
     }
-    if (stage == 1)
+    if (stage < 3)
         scanner_->skip();
     else
         set_listening(false);
@@ -1372,7 +1470,7 @@ void App::handle_input()
         }
     }
     if (pressed(ImGuiKey_N) && scanning())
-        scanner_->skip();
+        skip_signal();
     if (pressed(ImGuiKey_P) || pressed(ImGuiKey_F12))
         take_screenshot({});
     if (pressed(ImGuiKey_F11) || pressed(ImGuiKey_F))
@@ -1442,6 +1540,8 @@ void App::set_listening(bool on)
     listener.set_deemphasis(listen_.deemphasis);
     listener.set_volume(listen_.volume);
     listener.set_squelch(listen_.squelch);
+    listener.set_dmr_only(listen_.dmr_only);
+    listener.set_p25_only(listen_.p25_only);
     listener.set_enabled(true);
     listen_.on = true;
 #else
@@ -1469,6 +1569,9 @@ void App::start_scanning()
     constexpr float kNothingYet = 1e9f;
     scanner_->set_threshold(std::isnan(listen_.scan_threshold) ? kNothingYet : listen_.scan_threshold);
     scanner_->set_hang(listen_.scan_hang);
+    scanner_->set_dmr_only(listen_.dmr_only);
+    scanner_->set_p25_only(listen_.p25_only);
+    scanner_->set_dmr_hold(listen_.dmr_hold);
     scanner_->start();  // mutes the listener until it finds something
     set_listening(true);
     if (!listen_.on) {
@@ -1493,6 +1596,70 @@ bool App::scan_locked() const
     return state == Scanner::State::Receiving || state == Scanner::State::Holding;
 }
 
+// Listens to a channel DMR voice was heard on: narrowband, and with the radio
+// retuned first if the channel is outside the band it receives (the channel
+// then a quarter of the band above the centre, clear of the DC spike).
+void App::listen_to_heard(double hz, int phase2_slot)
+{
+    IqSource&    source = pipeline_.source();
+    const double fs     = source.sample_rate();
+    const double width  = Listener::kDefaultBandwidth;
+    if (std::fabs(hz - source.frequency()) + 0.5 * width > 0.45 * fs) {
+        if (!source.info().tunable) {
+            toast("That channel is outside the band received, and this source cannot be tuned");
+            return;
+        }
+        tune_to(hz - 0.25 * fs);
+    }
+    listen_.bandwidth = width;
+    pipeline_.listener().set_bandwidth(width);
+    listen_to(hz, 0.0);
+    pipeline_.listener().set_p25_phase2_slot(phase2_slot);
+    char text[64];
+    if (phase2_slot >= 0)
+        std::snprintf(text, sizeof(text), "Listening to %.5f MHz, slot %d", hz / 1e6, phase2_slot + 1);
+    else
+        std::snprintf(text, sizeof(text), "Listening to %.5f MHz", hz / 1e6);
+    toast(text);
+}
+
+// Following a P25 system's calls: on or off.
+void App::set_following(bool on)
+{
+    listen_.follow = on;
+    follower_.set_enabled(on);
+}
+
+// Where the follower says to go: a call's voice channel, or back to the
+// control channel.  If it lies outside the band received the radio is
+// retuned - where possible so that both channels fit, and the next call
+// needs none.
+void App::follow_to(const FollowAction& action)
+{
+    IqSource&    source = pipeline_.source();
+    const double fs     = source.sample_rate();
+    const double width  = Listener::kDefaultBandwidth;
+    const auto   fits   = [&](double centre, double hz) { return std::fabs(hz - centre) + 0.5 * width <= 0.45 * fs; };
+    if (!fits(source.frequency(), action.frequency)) {
+        if (!source.info().tunable) {
+            toast("The call is outside the band received, and this source cannot be tuned: not following calls");
+            set_following(false);
+            return;
+        }
+        const double control = follower_.control_frequency();
+        const double both    = 0.5 * (action.frequency + control);
+        tune_to(fits(both, action.frequency) && fits(both, control) ? both : action.frequency - 0.25 * fs);
+    }
+    listen_.bandwidth = width;
+    pipeline_.listener().set_bandwidth(width);
+    listen_to(action.frequency, 0.0);
+    pipeline_.listener().set_p25_phase2_slot(action.slot);
+    if (follower_.state() == TrunkFollower::State::Voice)
+        LOG_INFO("P25: %s", follower_.describe().c_str());
+    else
+        LOG_INFO("P25: back to the control channel at %.5f MHz", action.frequency / 1e6);
+}
+
 // Selects the channel to listen to and turns the audio on.  With `search_hz`
 // the receiver looks for the carrier that far around `hz` and centres on it.
 // Choosing a channel ends scanning.
@@ -1503,6 +1670,7 @@ void App::listen_to(double hz, double search_hz)
     listen_.frequency = hz;
     listen_mhz_       = hz / 1e6;
     pipeline_.listener().tune(hz, search_hz);
+    pipeline_.listener().set_p25_phase2_slot(-1);  // whichever speaks, unless the caller says
     set_listening(true);
 }
 
@@ -1529,6 +1697,99 @@ bool App::choose_channel_at(float window_x, float window_y, bool find_carrier)
 void App::update_listening()
 {
     listen_status_ = pipeline_.listener().status();
+    // Tell the terminal what kind of signal the channel carries, when that changes.
+    {
+        const SignalClass& signal = listen_status_.signal;
+        if (!listen_.on || signal.kind == SignalKind::Analysing) {
+            logged_signal_.clear();
+        } else {
+            char key[160];
+            std::snprintf(key, sizeof(key), "%.0f %d %s %.0f %.1f %d", listen_status_.frequency,
+                          static_cast<int>(signal.kind), signal.protocol.c_str(), signal.symbol_rate, signal.ctcss_hz,
+                          signal.stereo);
+            if (logged_signal_ != key) {
+                logged_signal_ = key;
+                const std::string typical = typical_systems(signal);
+                LOG_INFO("Signal at %.5f MHz: %s (SNR %.0f dB)%s%s", listen_status_.frequency / 1e6,
+                         describe(signal).c_str(), static_cast<double>(signal.snr_db),
+                         typical.empty() ? "" : " - typical of ", typical.c_str());
+            }
+        }
+    }
+    // Remember the channels DMR or P25 voice comes through on.
+    const bool settled = listen_.on && listen_status_.in_band && !listen_status_.searching;
+    heard_.update(settled ? listen_status_.frequency : std::numeric_limits<double>::quiet_NaN(), listen_status_.dmr,
+                  listen_status_.p25, std::chrono::duration<double>(Clock::now().time_since_epoch()).count(),
+                  listen_status_.p25p2);
+
+    // And of DMR calls as they start and as their callers become known.
+    for (int s = 0; s < 2; ++s) {
+        const DmrCall& call = listen_status_.dmr.slot[s];
+        std::string    key;
+        if (listen_.on && listen_status_.dmr.present && call.active)
+            key = describe_dmr_slot(listen_status_.dmr, s);
+        if (key != logged_dmr_[s]) {
+            if (!key.empty())
+                LOG_INFO("DMR at %.5f MHz, time slot %d: %s", listen_status_.frequency / 1e6, s + 1, key.c_str());
+            logged_dmr_[s] = key;
+        }
+    }
+    {
+        std::string key;
+        if (listen_.on && listen_status_.p25.present && listen_status_.p25.call.active)
+            key = describe_p25(listen_status_.p25);
+        if (key != logged_p25_) {
+            if (!key.empty())
+                LOG_INFO("P25 at %.5f MHz (NAC 0x%03X): %s", listen_status_.frequency / 1e6,
+                         static_cast<unsigned>(std::max(listen_status_.p25.nac, 0)), key.c_str());
+            logged_p25_ = key;
+        }
+        // P25 Phase 2: the call on each slot.
+        const P25Phase2Status& p2 = listen_status_.p25p2;
+        for (int s = 0; s < 2; ++s) {
+            std::string slot_key;
+            if (listen_.on && p2.present && p2.slot[s].active)
+                slot_key = describe_p25_phase2_slot(p2, s);
+            if (slot_key != logged_p25p2_[s]) {
+                if (!slot_key.empty())
+                    LOG_INFO("P25 Phase 2 at %.5f MHz, slot %d: %s", listen_status_.frequency / 1e6, s + 1,
+                             slot_key.c_str());
+                logged_p25p2_[s] = slot_key;
+            }
+        }
+        // A control channel: its system once, then each call it grants.
+        const P25Status& p25 = listen_status_.p25;
+        if (listen_.on && p25.present && p25.site.system >= 0 && p25.site.wacn >= 0 && p25.site.site >= 0) {
+            char site[160];
+            std::snprintf(site, sizeof(site), "system 0x%03X, WACN 0x%05X, NAC 0x%03X, RFSS %d, site %d",
+                          static_cast<unsigned>(p25.site.system), static_cast<unsigned>(std::max(p25.site.wacn, 0)),
+                          static_cast<unsigned>(std::max(p25.nac, 0)), p25.site.rfss, p25.site.site);
+            // Once per system - and again if more of its channel plans turn
+            // up, but not as they are heard afresh on coming back to it.
+            const std::string phases = p25.site.voice_phases();
+            if (logged_p25_site_ != site || phases.size() > logged_p25_phases_.size()) {
+                LOG_INFO("P25 control channel at %.5f MHz: %s; voice in %s", listen_status_.frequency / 1e6, site,
+                         phases.empty() ? "?" : phases.c_str());
+                logged_p25_site_   = site;
+                logged_p25_phases_ = phases;
+            }
+            for (const P25Grant& g : p25.grants) {
+                if (g.frequency <= 0.0)
+                    continue;
+                char grant[160];
+                std::snprintf(grant, sizeof(grant), "%s%s on %.5f MHz%s%s", p25_grant_destination(g).c_str(),
+                              g.source ? (" from " + std::to_string(g.source)).c_str() : "", g.frequency / 1e6,
+                              g.slot >= 0 ? (", Phase 2 slot " + std::to_string(g.slot % 2 + 1)).c_str() : ", Phase 1",
+                              g.encrypted ? ", encrypted" : "");
+                if (std::find(logged_p25_grants_.begin(), logged_p25_grants_.end(), grant) != logged_p25_grants_.end())
+                    continue;
+                LOG_INFO("P25 grant: %s", grant);
+                logged_p25_grants_.push_back(grant);
+                if (logged_p25_grants_.size() > 32)
+                    logged_p25_grants_.erase(logged_p25_grants_.begin());
+            }
+        }
+    }
     if (listen_.on) {
         listen_.frequency = listen_status_.frequency;  // a search moves it onto the carrier
         if (scanning())
@@ -1556,6 +1817,15 @@ void App::update_listening()
             listen_.scan_threshold = std::round(scan.floor_dbfs + Scanner::kDefaultThresholdAboveFloor);
             scanner_->set_threshold(listen_.scan_threshold);
         }
+    }
+    // Following a P25 system's calls (not while scanning: the scanner chooses the channels then).
+    if (listen_.on && !scanning() && follower_.enabled()) {
+        const FollowAction action =
+            follower_.update(settled ? listen_status_.frequency : std::numeric_limits<double>::quiet_NaN(),
+                             listen_status_.p25, listen_status_.p25p2,
+                             std::chrono::duration<double>(Clock::now().time_since_epoch()).count());
+        if (action.tune)
+            follow_to(action);
     }
 }
 
@@ -1698,9 +1968,38 @@ void App::draw_listen_label()
     if (!project_to_screen(view_projection(), anchor, io.DisplaySize.x, io.DisplaySize.y, x, y))
         return;
 
-    char text[64];
-    std::snprintf(text, sizeof(text), "%s %.5f MHz", listen_wide() ? "WFM" : "NFM", listen_.frequency / 1e6);
-    const bool   audible = listen_in_band() && listen_status_.squelch_open &&
+    char              text[96];
+    std::string       kind = short_name(listen_status_.signal);
+    const DmrStatus&  dmr  = listen_status_.dmr;
+    if (dmr.present) {
+        // The call being heard, or else any call.
+        int slot = dmr.playing;
+        for (int s = 0; s < 2 && slot < 0; ++s)
+            slot = dmr.slot[s].active ? s : -1;
+        kind = "DMR";
+        if (slot >= 0) {
+            const std::string to = dmr_destination(dmr.slot[slot]);
+            kind += " TS" + std::to_string(slot + 1) + (to.empty() ? "" : " " + to);
+            if (dmr.slot[slot].encrypted)
+                kind += " (encrypted)";
+        }
+    }
+    const P25Status& p25 = listen_status_.p25;
+    if (p25.present && !dmr.present) {
+        kind = "P25";
+        if (p25.call.active) {
+            const std::string to = p25_destination(p25.call);
+            kind += to.empty() ? "" : " " + to;
+            if (p25.call.encrypted)
+                kind += " (encrypted)";
+        }
+    }
+    std::snprintf(text, sizeof(text), "%s %.5f MHz%s%s", listen_wide() ? "WFM" : "NFM", listen_.frequency / 1e6,
+                  kind.empty() ? "" : "  ", kind.c_str());
+    const bool wanted = (listen_status_.dmr_only && dmr.present) || (listen_status_.p25_only && p25.present);
+    const bool filtered = listen_status_.dmr_only || listen_status_.p25_only;
+    const bool   audible = listen_in_band() && (listen_status_.squelch_open || dmr.present || p25.present) &&
+                         (!filtered || wanted) &&
                          (!scanning() || scanner_->status().state == Scanner::State::Receiving);
     const ImVec2 size    = ImGui::CalcTextSize(text);
     const float  line    = ImGui::GetFontSize();
@@ -1967,8 +2266,17 @@ void App::draw_listen_window()
                                        scanner_->candidates().size());
                 break;
             case Scanner::State::Receiving:
-                ImGui::TextColored(green, "Receiving %s FM, %.0f kHz wide", st.wide ? "wideband" : "narrowband",
-                                   st.occupied_hz / 1e3);
+                if (st.voice)
+                    ImGui::TextColored(green, "%s call: staying until it ends", st.p25 && !st.dmr ? "P25" : "DMR");
+                else if (scanner_->filtered() && st.wanted)
+                    ImGui::TextColored(amber, "%s, no call: moving on in %.1f s", st.p25 && !st.dmr ? "P25" : "DMR",
+                                       st.wait_left);
+                else if (scanner_->filtered())
+                    ImGui::TextColored(amber, "Not %s: moving on in %.1f s", digital_filter_name().c_str(),
+                                       st.wait_left);
+                else
+                    ImGui::TextColored(green, "Receiving %s FM, %.0f kHz wide", st.wide ? "wideband" : "narrowband",
+                                       st.occupied_hz / 1e3);
                 break;
             case Scanner::State::Holding:
                 ImGui::TextColored(amber, "Signal gone: moving on in %.1f s", st.hold_left);
@@ -1997,10 +2305,11 @@ void App::draw_listen_window()
 
             ImGui::BeginDisabled(!scan_locked());
             if (ImGui::Button("Skip (N)"))
-                scanner_->skip();
+                skip_signal();
             ImGui::EndDisabled();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Move on, and leave this signal out from now on");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Move on to the next signal, leaving this one out until the end of the list;\n"
+                                  "skipping the last one starts again from the first");
             if (scanner_->lockouts() > 0) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("%zu skipped", scanner_->lockouts());
@@ -2066,6 +2375,51 @@ void App::draw_listen_window()
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Mute the audio while the channel is below this level");
 
+        const char* const no_vocoder =
+            listen_status_.vocoder ? "" : "\nThis build has no vocoder, so the voice is silent too (see the README).";
+        if (ImGui::Checkbox("DMR only", &listen_.dmr_only)) {
+            listener.set_dmr_only(listen_.dmr_only);
+            if (scanner_)
+                scanner_->set_dmr_only(listen_.dmr_only);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Play only DMR voice: analog audio and other digital modes stay silent.\n"
+                              "Scanning, move on from anything that is not DMR, and from a DMR channel\n"
+                              "without a call once the hold time is up.  With P25 only too, both.%s",
+                              no_vocoder);
+        ImGui::SameLine();
+        if (ImGui::Checkbox("P25 only", &listen_.p25_only)) {
+            listener.set_p25_only(listen_.p25_only);
+            if (scanner_)
+                scanner_->set_p25_only(listen_.p25_only);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Play only P25 voice, Phase 1 and 2: analog audio and other digital modes stay\n"
+                              "silent.  Scanning, move on from anything that is not P25, and from a P25 channel\n"
+                              "without a call once the hold time is up.  With DMR only too, both.%s",
+                              no_vocoder);
+        bool follow = listen_.follow;
+        if (ImGui::Checkbox("Follow calls", &follow))
+            set_following(follow);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("On a P25 trunked system's control channel: go to the voice channel of each call\n"
+                              "it grants - Phase 1, or Phase 2 and its slot - and back when the call ends.\n"
+                              "Calls that are encrypted are left out.  Not while scanning.");
+        draw_following();
+        if ((listen_.dmr_only || listen_.p25_only) && scanning()) {
+            float hold = static_cast<float>(listen_.dmr_hold);
+            if (ImGui::SliderFloat("Hold", &hold, 1.0f, 60.0f, "%.0f s",
+                                   ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic)) {
+                listen_.dmr_hold = hold;
+                scanner_->set_dmr_hold(hold);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How long to stay on a DMR or P25 channel waiting for a call (and for the\n"
+                                  "next over after one ends) before moving on");
+        }
+        if (listen_.dmr_only || listen_.p25_only)
+            draw_heard_channels();
+
         if (scanning() && !scan_locked()) {
             // Nothing to report until the scanner finds something.
         } else if (!listen_in_band()) {
@@ -2075,11 +2429,44 @@ void App::draw_listen_window()
             ImGui::SameLine();
             if (listen_status_.searching)
                 ImGui::TextDisabled("  finding the carrier");
+            else if (listen_status_.dmr.present)
+                ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1.0f), "  decoding DMR");
+            else if (listen_status_.p25.present || listen_status_.p25p2.present)
+                ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1.0f), "  decoding P25");
+            else if (listen_status_.dmr_only || listen_status_.p25_only)
+                ImGui::TextDisabled("  silent: not %s", digital_filter_name().c_str());
             else if (listen_status_.squelch_open)
                 ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1.0f), "  playing");
             else
                 ImGui::TextDisabled("  squelched");
         }
+        // What kind of signal it is.
+        if (listen_in_band() && !(scanning() && !scan_locked())) {
+            const SignalClass& signal = listen_status_.signal;
+            const ImVec4       colour = signal.digital() ? ImVec4(0.45f, 0.78f, 1.0f, 1.0f)
+                                        : signal.kind == SignalKind::Analog || signal.kind == SignalKind::Broadcast
+                                            ? ImVec4(0.45f, 0.85f, 0.55f, 1.0f)
+                                            : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+            ImGui::PushStyleColor(ImGuiCol_Text, colour);
+            ImGui::TextWrapped("%s", describe(signal).c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("What the signal looks like to the demodulator, judged half a second at a time:\n"
+                                  "analog audio, or digital modulation with its symbol rate and deviation.\n"
+                                  "DMR, P25 and POCSAG are named when their sync patterns are found.");
+            if (signal.kind != SignalKind::Analysing && signal.kind != SignalKind::Noise)
+                ImGui::TextDisabled("SNR %.0f dB", static_cast<double>(signal.snr_db));
+            const std::string typical = typical_systems(signal);
+            if (!typical.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                ImGui::TextWrapped("Typical of %s", typical.c_str());
+                ImGui::PopStyleColor();
+            }
+            draw_dmr_status();
+            draw_p25_status();
+            draw_p25_phase2_status();
+        }
+
         ImGui::SeparatorText("Audio");
         draw_audio_plot();
 
@@ -2111,6 +2498,294 @@ void App::draw_listen_window()
 // envelope - the lowest and highest value per pixel - on the long ones.  It
 // shows the audio before the volume control, so +/-1 is always full scale,
 // and it freezes while the display is paused.
+// The channels DMR voice has been heard on; a click goes back to one.
+void App::draw_heard_channels()
+{
+    ImGui::SeparatorText("Voice heard on");
+    const std::vector<HeardChannel>& channels = heard_.channels();
+    if (channels.empty()) {
+        ImGui::TextDisabled("No DMR or P25 voice heard yet");
+        return;
+    }
+    const double now     = std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+    const auto   ago     = [](double seconds) {
+        char text[24];
+        if (seconds < 2.0)
+            std::snprintf(text, sizeof(text), "now");
+        else if (seconds < 120.0)
+            std::snprintf(text, sizeof(text), "%.0f s", seconds);
+        else if (seconds < 7200.0)
+            std::snprintf(text, sizeof(text), "%.0f min", seconds / 60.0);
+        else
+            std::snprintf(text, sizeof(text), "%.0f h", seconds / 3600.0);
+        return std::string(text);
+    };
+    const ImVec4 secret(1.0f, 0.55f, 0.25f, 1.0f);
+    const float  line  = ImGui::GetTextLineHeightWithSpacing();
+    const float  shown = static_cast<float>(std::min<size_t>(channels.size(), 8));
+    double       chosen = std::numeric_limits<double>::quiet_NaN();
+    if (ImGui::BeginTable("heard", 4, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit,
+                          ImVec2(0.0f, (shown + 1.4f) * line))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("MHz");
+        ImGui::TableSetupColumn("Calls");
+        ImGui::TableSetupColumn("Heard");
+        ImGui::TableSetupColumn("Last", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < channels.size(); ++i) {
+            const HeardChannel& c = channels[i];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            char label[40];
+            std::snprintf(label, sizeof(label), "%.5f##heard%zu", c.frequency / 1e6, i);
+            const bool here = listen_.on && std::fabs(listen_.frequency - c.frequency) < HeardChannels::kSameChannelHz;
+            if (ImGui::Selectable(label, here, ImGuiSelectableFlags_SpanAllColumns))
+                chosen = c.frequency;
+            if (ImGui::IsItemHovered()) {
+                if (c.system == "P25")
+                    ImGui::SetTooltip("Listen here%s\nP25, NAC 0x%03X; the last call:\n%s", scanning() ? " (ends scanning)" : "",
+                                      static_cast<unsigned>(std::max(c.nac, 0)), c.last_call.c_str());
+                else if (c.system == "P25 Phase 2")
+                    ImGui::SetTooltip("Listen here%s\nP25 Phase 2; the last call, on slot %d:\n%s",
+                                      scanning() ? " (ends scanning)" : "", c.slot + 1, c.last_call.c_str());
+                else
+                    ImGui::SetTooltip("Listen here%s\nDMR, colour code %d; the last call, on time slot %d:\n%s",
+                                      scanning() ? " (ends scanning)" : "", c.color_code, c.slot + 1, c.last_call.c_str());
+            }
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", c.calls);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ago(now - c.last_heard).c_str());
+            ImGui::TableNextColumn();
+            const std::string last = c.system + " " + (c.talkgroup.empty() ? (c.encrypted ? "encrypted" : "-") : c.talkgroup);
+            if (c.encrypted)
+                ImGui::TextColored(secret, "%s", last.c_str());
+            else
+                ImGui::TextUnformatted(last.c_str());
+        }
+        ImGui::EndTable();
+    }
+    if (ImGui::SmallButton("Clear##heard"))
+        heard_.clear();
+    if (!std::isnan(chosen))
+        listen_to_heard(chosen);
+}
+
+// "DMR", "P25" or "DMR or P25": what DMR only and P25 only let through.
+std::string App::digital_filter_name() const
+{
+    if (listen_.dmr_only && listen_.p25_only)
+        return "DMR or P25";
+    return listen_.p25_only ? "P25" : "DMR";
+}
+
+// P25 on the channel: its network access code, and the call.
+void App::draw_p25_status()
+{
+    const P25Status& p25 = listen_status_.p25;
+    if (!p25.present)
+        return;
+    ImGui::SeparatorText("P25");
+    ImGui::Text("NAC 0x%03X%s", static_cast<unsigned>(std::max(p25.nac, 0)), p25.control ? ", control channel" : "");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The network access code tells the systems on a frequency apart.\n"
+                          "A control channel carries a trunked system's signalling; its calls are\n"
+                          "on other frequencies: click one below, or tick Follow calls.");
+    // A control channel: its system, and the calls it grants.
+    const P25Site& site = p25.site;
+    if (site.system >= 0) {
+        std::string text = "System 0x";
+        char        part[48];
+        std::snprintf(part, sizeof(part), "%03X", static_cast<unsigned>(site.system));
+        text += part;
+        if (site.wacn >= 0) {
+            std::snprintf(part, sizeof(part), ", WACN 0x%05X", static_cast<unsigned>(site.wacn));
+            text += part;
+        }
+        if (site.site >= 0) {
+            std::snprintf(part, sizeof(part), ", RFSS %d, site %d", site.rfss, site.site);
+            text += part;
+        }
+        ImGui::TextWrapped("%s", text.c_str());
+        const std::string phases = site.voice_phases();
+        if (!phases.empty()) {
+            ImGui::TextDisabled("Voice in %s", phases.c_str());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("From the system's channel plans: FDMA ones carry Phase 1 voice, TDMA ones\n"
+                                  "Phase 2 - two calls to a channel, scrambled with a key made from the\n"
+                                  "system's IDs above, which is why Phase 2 is only read after visiting here.");
+        }
+    }
+    if (!p25.grants.empty()) {
+        ImGui::TextDisabled("Calls granted:");
+        double chosen      = std::numeric_limits<double>::quiet_NaN();
+        int    chosen_slot = -1;
+        for (size_t i = 0; i < p25.grants.size(); ++i) {
+            const P25Grant& g   = p25.grants[i];
+            const double    age = std::max(0.0, p25.time - g.time);
+            char            label[128];
+            if (g.frequency > 0.0)
+                std::snprintf(label, sizeof(label), "%s%s  %.5f%s  %.0f s##grant%zu", p25_grant_destination(g).c_str(),
+                              g.encrypted ? " (enc.)" : "", g.frequency / 1e6,
+                              g.slot < 0 ? "" : g.slot % 2 == 0 ? " slot 1" : " slot 2", age, i);
+            else
+                std::snprintf(label, sizeof(label), "%s  channel %X-%03X  %.0f s##grant%zu", p25_grant_destination(g).c_str(),
+                              g.channel >> 12, g.channel & 0xFFFu, age, i);
+            const bool known = g.frequency > 0.0;
+            ImGui::BeginDisabled(!known);
+            if (ImGui::Selectable(label)) {
+                chosen      = g.frequency;
+                chosen_slot = g.slot >= 0 ? g.slot % 2 : -1;
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                const std::string from = g.source ? " from " + std::to_string(g.source) : "";
+                if (known && g.slot < 0)
+                    ImGui::SetTooltip("%s%s on %.5f MHz (Phase 1)\nClick to listen there", p25_grant_destination(g).c_str(),
+                                      from.c_str(), g.frequency / 1e6);
+                else if (known)
+                    ImGui::SetTooltip("%s%s on %.5f MHz, slot %d (Phase 2)\nClick to listen there",
+                                      p25_grant_destination(g).c_str(), from.c_str(), g.frequency / 1e6, g.slot % 2 + 1);
+                else
+                    ImGui::SetTooltip("%s%s: the channel plan for channel %X-%03X has not been heard yet",
+                                      p25_grant_destination(g).c_str(), from.c_str(), g.channel >> 12, g.channel & 0xFFFu);
+            }
+        }
+        if (!std::isnan(chosen))
+            listen_to_heard(chosen, chosen_slot);
+    }
+
+    const P25Call& c      = p25.call;
+    const ImVec4   colour = !c.active      ? ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled)
+                            : c.encrypted ? ImVec4(1.0f, 0.55f, 0.25f, 1.0f)
+                            : listen_status_.vocoder ? ImVec4(0.45f, 0.85f, 0.55f, 1.0f)
+                                                     : ImVec4(0.45f, 0.78f, 1.0f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, colour);
+    ImGui::TextWrapped("%s%s", describe_p25(p25).c_str(),
+                       c.active && !c.encrypted && listen_status_.vocoder ? "  (playing)" : "");
+    ImGui::PopStyleColor();
+    if (c.active && c.voice && !c.encrypted && !listen_status_.vocoder) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.55f, 0.25f, 1.0f));
+        ImGui::TextWrapped("Voice not decoded: built without the IMBE vocoder");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Build with -DSPECTRO_WITH_MBELIB=ON to hear P25 voice (see the README).");
+    }
+}
+
+// P25 Phase 2 on the channel: the system (if known, the voice can be read)
+// and the call on each slot, and which to hear.
+void App::draw_p25_phase2_status()
+{
+    const P25Phase2Status& p2 = listen_status_.p25p2;
+    if (!p2.present)
+        return;
+    ImGui::SeparatorText("P25 Phase 2");
+    const ImVec4 heard(0.45f, 0.85f, 0.55f, 1.0f), call(0.45f, 0.78f, 1.0f, 1.0f), secret(1.0f, 0.55f, 0.25f, 1.0f);
+    if (p2.keyed) {
+        ImGui::TextWrapped("System 0x%03X, WACN 0x%05X, NAC 0x%03X%s", static_cast<unsigned>(p2.system.system),
+                           static_cast<unsigned>(p2.system.wacn), static_cast<unsigned>(p2.system.nac),
+                           p2.recovered ? " (from its signalling)" : "");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Phase 2 is scrambled with a sequence made from these.  %s",
+                              p2.recovered ? "They were worked out from a clean signalling burst on this channel."
+                                           : "They came from the system's control channel.");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, secret);
+        ImGui::TextWrapped("Scrambled: working out the system");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Phase 2 is scrambled with a sequence made from the system's WACN, system ID and\n"
+                              "NAC.  They are worked out from the first signalling burst that comes through\n"
+                              "without errors - usually within a second of a call starting; a noisy channel\n"
+                              "takes longer.  The system's control channel, once heard, gives them too.\n"
+                              "Until then calls are seen, but not who makes them, and not heard.");
+    }
+    bool voice = false;
+    for (int s = 0; s < 2; ++s) {
+        const P25Call& c = p2.slot[s];
+        voice |= c.active && c.voice && !c.encrypted && p2.keyed;
+        const ImVec4 colour = !c.active      ? ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled)
+                              : c.encrypted ? secret
+                              : p2.playing == s && listen_status_.vocoder ? heard
+                                                                          : call;
+        ImGui::PushStyleColor(ImGuiCol_Text, colour);
+        ImGui::TextWrapped("Slot %d  %s%s", s + 1, describe_p25_phase2_slot(p2, s).c_str(),
+                           c.active && p2.playing == s && !c.encrypted && listen_status_.vocoder ? "  (playing)" : "");
+        ImGui::PopStyleColor();
+    }
+    // Which slot to hear.
+    int slot = listen_status_.p25p2_slot + 1;
+    ImGui::TextDisabled("Hear");
+    ImGui::SameLine();
+    bool changed = ImGui::RadioButton("either", &slot, 0);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Whichever slot speaks first; when its call ends, the next");
+    ImGui::SameLine();
+    changed |= ImGui::RadioButton("slot 1", &slot, 1);
+    ImGui::SameLine();
+    changed |= ImGui::RadioButton("slot 2", &slot, 2);
+    if (changed)
+        pipeline_.listener().set_p25_phase2_slot(slot - 1);
+    if (voice && !listen_status_.vocoder) {
+        ImGui::PushStyleColor(ImGuiCol_Text, secret);
+        ImGui::TextWrapped("Voice not decoded: built without the AMBE+2 vocoder");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Build with -DSPECTRO_WITH_MBELIB=ON to hear P25 Phase 2 voice (see the README).");
+    }
+}
+
+// Following a P25 system's calls: where the follower is.
+void App::draw_following()
+{
+    if (!listen_.follow)
+        return;
+    if (scanning()) {
+        ImGui::TextDisabled("Following calls: paused while scanning");
+        return;
+    }
+    const ImVec4 colour = follower_.state() == TrunkFollower::State::Voice ? ImVec4(0.45f, 0.85f, 0.55f, 1.0f)
+                                                                           : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+    ImGui::PushStyleColor(ImGuiCol_Text, colour);
+    ImGui::TextWrapped("%s", follower_.describe().c_str());
+    ImGui::PopStyleColor();
+}
+
+// DMR on the channel: the repeater or radios, and the call on each time slot.
+void App::draw_dmr_status()
+{
+    const DmrStatus& dmr = listen_status_.dmr;
+    if (!dmr.present)
+        return;
+    ImGui::SeparatorText("DMR");
+    ImGui::Text("%s, colour code %d", dmr.repeater ? "Repeater" : "Radios direct", dmr.color_code);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("A repeater sends both time slots all the time; radios talking directly send one.\n"
+                          "The colour code tells repeaters on the same frequency apart.");
+    const ImVec4 heard(0.45f, 0.85f, 0.55f, 1.0f), call(0.45f, 0.78f, 1.0f, 1.0f), secret(1.0f, 0.55f, 0.25f, 1.0f);
+    bool         voice = false;
+    for (int s = 0; s < 2; ++s) {
+        const DmrCall& c = dmr.slot[s];
+        voice |= c.active && c.voice && !c.encrypted;
+        const ImVec4 colour = !c.active      ? ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled)
+                              : c.encrypted ? secret
+                              : dmr.playing == s && listen_status_.vocoder ? heard
+                                                                           : call;
+        ImGui::PushStyleColor(ImGuiCol_Text, colour);
+        ImGui::TextWrapped("TS%d  %s%s", s + 1, describe_dmr_slot(dmr, s).c_str(),
+                           c.active && dmr.playing == s && !c.encrypted && listen_status_.vocoder ? "  (playing)" : "");
+        ImGui::PopStyleColor();
+    }
+    if (voice && !listen_status_.vocoder) {
+        ImGui::PushStyleColor(ImGuiCol_Text, secret);
+        ImGui::TextWrapped("Voice not decoded: built without the AMBE+2 vocoder");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Build with -DSPECTRO_WITH_MBELIB=ON to hear DMR voice (see the README).");
+    }
+}
+
 void App::draw_audio_plot()
 {
     const AudioScope& scope = pipeline_.listener().scope();

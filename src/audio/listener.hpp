@@ -3,6 +3,13 @@
 //
 //   receive thread ──tap──▶ IqRing ──▶ audio thread (FmDemodulator) ──▶ AudioFifo ──▶ sound card
 //
+// A narrowband channel that carries DMR or P25 is heard through its vocoder
+// instead: the demodulator's frequency goes to a DmrDecoder, a P25Decoder and
+// a P25Phase2Decoder, their voice frames to the AMBE+2 or IMBE decoder, and
+// the speech takes the place of the FM audio (silence while there is none, or
+// no vocoder).  The systems P25 control channels announce are remembered: a
+// Phase 2 voice channel can only be read knowing its system.
+//
 // While nobody listens there is no tap, and none of this costs anything.
 //
 // The audio thread also keeps the audio in step with the sound card's clock
@@ -17,7 +24,11 @@
 #include "audio/audio_fifo.hpp"
 #include "audio/audio_scope.hpp"
 #include "audio/scanner.hpp"
+#include "dsp/dmr_decoder.hpp"
 #include "dsp/fm_demod.hpp"
+#include "dsp/p25_decoder.hpp"
+#include "dsp/p25_phase2_decoder.hpp"
+#include "dsp/signal_classifier.hpp"
 #include "radio/acquisition.hpp"
 #include "radio/iq_source.hpp"
 #include "util/iq_ring.hpp"
@@ -32,6 +43,8 @@ struct ListenStatus {
     double frequency    = 0.0;      // Hz; a search moves it onto the carrier
     double bandwidth    = 0.0;      // Hz, as used: limited to what the stream can carry
     FmMode mode         = FmMode::Narrow;
+    bool   dmr_only     = false;    // set_dmr_only()
+    bool   p25_only     = false;    // set_p25_only()
     float  level_dbfs   = -200.0f;  // power in the channel
     float  audio_rms    = 0.0f;     // of the demodulated audio, before the volume control
     float  load         = 0.0f;     // fraction of one core used by the audio thread
@@ -40,6 +53,13 @@ struct ListenStatus {
     uint64_t dropped_iq    = 0;     // samples the audio thread did not take over in time
     uint64_t underruns     = 0;     // times the sound card ran out of audio
     uint64_t overruns      = 0;     // times audio was discarded because the sound card fell behind
+    SignalClass signal;             // what kind of signal the channel carries
+    DmrStatus   dmr;                // DMR, when that is what it carries
+    P25Status   p25;                // P25 Phase 1, likewise
+    P25Phase2Status p25p2;          // P25 Phase 2, likewise
+    int         p25p2_slot = -1;    // set_p25_phase2_slot()
+    std::vector<p25p2::System> p25_systems;  // heard on control channels: what Phase 2 can be read for
+    bool        vocoder = false;    // digital voice can be heard (built with the vocoders)
 };
 
 class Listener final : private IqTap, public ScanReceiver {
@@ -92,6 +112,13 @@ public:
     void set_squelch(float threshold_dbfs);  // FmDemodulator::kSquelchOff: always open
     void set_volume(float volume);           // 0 ... 1
     void set_muted(bool muted);              // silence without stopping (the audio keeps flowing)
+    // Play DMR voice only: whatever else the channel carries - analog audio,
+    // other digital modes - stays silent.  With P25 only as well, both play.
+    void set_dmr_only(bool dmr_only);
+    void set_p25_only(bool p25_only);  // Phase 1 and Phase 2
+    // P25 Phase 2: which of the two calls on a channel to hear (0 or 1);
+    // -1: the first to speak.
+    void set_p25_phase2_slot(int slot);
 
     ListenStatus status() const;
 
@@ -107,9 +134,11 @@ public:
     }
     void   scan_mute(bool muted) override { set_muted(muted); }
     double scan_frequency() const override;
+    ScanContent scan_content() const override;
 
 private:
     static double clamp_bandwidth(double hz);
+    void          forget_signal();
 
     struct Params {
         bool     enabled     = false;
@@ -122,6 +151,9 @@ private:
         float    squelch     = FmDemodulator::kSquelchOff;
         float    volume      = 0.5f;
         bool     muted       = false;
+        bool     dmr_only    = false;
+        bool     p25_only    = false;
+        int      p25p2_slot  = -1;
     };
 
     void on_samples(const int16_t* iq, size_t samples) override;  // receive thread
@@ -157,6 +189,12 @@ private:
     std::atomic<uint64_t> st_audio_samples_{0};
     std::atomic<uint64_t> st_overruns_{0};
     std::atomic<uint64_t> dropped_iq_{0};
+    mutable std::mutex    signal_mutex_;
+    SignalClass           signal_;
+    DmrStatus             dmr_;
+    P25Status             p25_;
+    P25Phase2Status       p25p2_;
+    std::vector<p25p2::System> p25_systems_;
 };
 
 }  // namespace spectro

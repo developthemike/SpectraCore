@@ -111,6 +111,11 @@ void Scanner::set_hang(double seconds)
     hang_ = std::clamp(seconds, 0.0, 60.0);
 }
 
+void Scanner::set_dmr_hold(double seconds)
+{
+    dmr_hold_ = std::clamp(seconds, 0.5, 600.0);
+}
+
 void Scanner::start()
 {
     if (active())
@@ -141,13 +146,26 @@ void Scanner::restart_spectrum()
     warmup_left_ = 1.5 * kSmoothingSeconds;
 }
 
-void Scanner::skip()
+bool Scanner::skip()
 {
     if (state_ != State::Receiving && state_ != State::Holding)
-        return;
-    const double half = 0.5 * std::max(locked_bw_, status_.occupied_hz);
-    lockouts_.push_back({locked_hz_ - half, locked_hz_ + half});
+        return false;
+    const double half    = 0.5 * std::max(locked_bw_, status_.occupied_hz);
+    const Range  skipped = {locked_hz_ - half, locked_hz_ + half};
+    // Is there anything else to go on to?  (The candidates leave out what
+    // has been skipped already.)
+    const bool more = std::any_of(candidates_.begin(), candidates_.end(), [&](const DetectedSignal& s) {
+        return s.frequency_hz < skipped.low || s.frequency_hz > skipped.high;
+    });
     release();
+    if (more) {
+        lockouts_.push_back(skipped);
+        return false;
+    }
+    // The end of the list: round again from the bottom.
+    lockouts_.clear();
+    resume_above_ = -1e300;
+    return true;
 }
 
 bool Scanner::locked_out(double frequency) const
@@ -165,6 +183,7 @@ void Scanner::lock(const DetectedSignal& signal, const SpectrumView& view)
     receiver_.scan_tune(locked_hz_, locked_bw_, search);
     receiver_.scan_mute(false);
     state_ = State::Receiving;
+    quiet_ = 0.0;
 
     status_.frequency   = locked_hz_;
     status_.bandwidth   = locked_bw_;
@@ -172,6 +191,11 @@ void Scanner::lock(const DetectedSignal& signal, const SpectrumView& view)
     status_.wide        = signal.wide;
     status_.level_dbfs  = signal.peak_dbfs;
     status_.hold_left   = 0.0;
+    status_.dmr         = false;
+    status_.p25         = false;
+    status_.voice       = false;
+    status_.wanted      = false;
+    status_.wait_left   = filtered() ? std::min(dmr_hold_, kRecogniseSeconds) : 0.0;
 }
 
 void Scanner::release()
@@ -240,6 +264,8 @@ void Scanner::on_row(const float* row_dbfs, const RowInfo& info, const SpectrumV
     for (const DetectedSignal& s : find_signals(power_.data(), view, floor_power_)) {
         if (s.peak_dbfs < threshold_ || s.occupied_hz > kFmMaxOccupied || locked_out(s.frequency_hz))
             continue;
+        if (filtered() && s.wide)
+            continue;  // DMR and P25 are narrowband
         const double half = 0.5 * listen_bandwidth_for(s, view.column_hz());
         if (std::fabs(s.frequency_hz - view.centre_hz) + half > 0.5 * view.sample_rate)
             continue;  // would not fit into the band
@@ -286,6 +312,38 @@ void Scanner::on_row(const float* row_dbfs, const RowInfo& info, const SpectrumV
             locked_hz_ = settled;
         status_.frequency  = locked_hz_;
         status_.level_dbfs = channel_peak(view);
+
+        const ScanContent content = std::isnan(settled) ? ScanContent{} : receiver_.scan_content();
+        const bool        voice   = filtered() ? (dmr_only_ && content.dmr_voice) || (p25_only_ && content.p25_voice)
+                                               : content.dmr_voice || content.p25_voice;
+        status_.dmr    = content.dmr;
+        status_.p25    = content.p25;
+        status_.voice  = voice;
+        status_.wanted = (dmr_only_ && content.dmr) || (p25_only_ && content.p25);
+
+        // A call holds the scanner until it ends, whatever the signal's level
+        // does meanwhile (only skipping, stopping or retuning leave it).
+        if (voice) {
+            quiet_            = 0.0;
+            status_.wait_left = filtered() ? dmr_hold_ : 0.0;
+            if (state_ == State::Holding) {
+                state_            = State::Receiving;
+                status_.hold_left = 0.0;
+                receiver_.scan_mute(false);
+            }
+            break;
+        }
+
+        // DMR/P25 only: anything else is not kept for long.
+        if (filtered() && !std::isnan(settled)) {
+            quiet_             = quiet_ + period;
+            const double limit = status_.wanted ? dmr_hold_ : std::min(dmr_hold_, kRecogniseSeconds);
+            status_.wait_left  = std::max(0.0, limit - quiet_);
+            if (quiet_ >= limit) {
+                release();
+                break;
+            }
+        }
 
         if (state_ == State::Receiving) {
             if (status_.level_dbfs < threshold_ - kHysteresisDb) {

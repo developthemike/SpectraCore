@@ -7,6 +7,7 @@
 #   PkgConfig::FFTW3F   single-precision FFTW                  (required, system)
 #   spectro_bladerf     libbladeRF                             (optional, system)
 #   spectro_rtlsdr      librtlsdr                              (optional, system)
+#   spectro_mbelib      mbelib-neo, the AMBE+2 vocoder         (optional, off by default, always fetched)
 #
 # and, when SPECTRO_BUILD_GUI is ON:
 #
@@ -33,6 +34,9 @@ set(SPECTRO_IMGUI_SHA256 f7bf6bc76e5d79d40d751096663e6c5d18daf08129dd52e7f7b09e4
 
 set(SPECTRO_MINIAUDIO_URL "https://github.com/mackron/miniaudio/archive/refs/tags/0.11.26.tar.gz")
 set(SPECTRO_MINIAUDIO_SHA256 838ba55a21c9142adf7b76bdc4351e5cd8b7ae128f46b25ec25f94ae9969c600)
+
+set(SPECTRO_MBELIB_URL "https://github.com/arancormonk/mbelib-neo/archive/refs/tags/v2.6.11.tar.gz")
+set(SPECTRO_MBELIB_SHA256 1eccb0b55699ec017f4d52b081e167f02ce1a5baaa15da5fc5c86c7a60cef88d)
 
 set(SPECTRO_GLSLANG_URL
     "https://github.com/KhronosGroup/glslang/archive/refs/tags/vulkan-sdk-1.4.341.0.tar.gz")
@@ -118,6 +122,35 @@ if(SPECTRO_WITH_RTLSDR)
     endif()
 else()
     message(STATUS "librtlsdr: disabled (SPECTRO_WITH_RTLSDR=OFF)")
+endif()
+
+# --- mbelib-neo (optional) -------------------------------------------------------
+# Decodes the AMBE+2 voice of DMR.  Off by default: the library is GPL-2.0-or-
+# later and the codec is patented (see the README).  It is built from its own
+# CMake project, which fetches the PFFFT revision it pins; only the static
+# library is built, and only what is called from it ends up in the program.
+set(SPECTRO_HAVE_MBELIB OFF)
+if(SPECTRO_WITH_MBELIB)
+    if(NOT SPECTRO_FETCH_MISSING)
+        message(FATAL_ERROR "SPECTRO_WITH_MBELIB needs SPECTRO_FETCH_MISSING=ON: mbelib-neo is always fetched.")
+    endif()
+    set(MBELIB_BUILD_TESTS        OFF CACHE BOOL "" FORCE)
+    set(MBELIB_BUILD_EXAMPLES     OFF CACHE BOOL "" FORCE)
+    set(MBELIB_BUILD_DOCS         OFF CACHE BOOL "" FORCE)
+    set(MBELIB_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+    set(MBELIB_ENABLE_NATIVE      ${SPECTRO_NATIVE_ARCH} CACHE BOOL "" FORCE)
+    FetchContent_Declare(mbelib_neo
+        URL "${SPECTRO_MBELIB_URL}"
+        URL_HASH SHA256=${SPECTRO_MBELIB_SHA256}
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        EXCLUDE_FROM_ALL)
+    FetchContent_MakeAvailable(mbelib_neo)
+    add_library(spectro_mbelib INTERFACE)
+    target_link_libraries(spectro_mbelib INTERFACE mbe_neo::mbe_static)
+    set(SPECTRO_HAVE_MBELIB ON)
+    message(STATUS "DMR voice: mbelib-neo (fetched)")
+else()
+    message(STATUS "DMR voice: not decoded (SPECTRO_WITH_MBELIB=OFF)")
 endif()
 
 # Everything below is only needed for the user interface.
