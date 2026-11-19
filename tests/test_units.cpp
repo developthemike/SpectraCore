@@ -137,11 +137,18 @@ TEST(options_listening)
     CHECK_NEAR(defaults.listen_bandwidth, 12.5e3, 1e-9);
 
     Options o;
-    CHECK(parse({"--listen", "446.00625M", "--listen-bw=25k", "--volume", "80", "--squelch", "-60"}, o, error));
+    CHECK(parse({"--listen", "446.00625M", "--listen-bw=25k", "--volume", "80", "--squelch", "-60", "--boost", "12dB"},
+                o, error));
     CHECK_NEAR(o.listen_frequency, 446.00625e6, 1e-3);
     CHECK_NEAR(o.listen_bandwidth, 25e3, 1e-9);
     CHECK_NEAR(o.volume, 80.0, 1e-12);
     CHECK_NEAR(o.squelch, -60.0, 1e-12);
+    CHECK_NEAR(o.boost_db, 12.0, 1e-12);
+    CHECK_NEAR(defaults.boost_db, 0.0, 0.0);  // no boost
+    Options loud;
+    CHECK(!parse({"--boost", "25"}, loud, error));
+    CHECK(error.find("between 0 and 20 dB") != std::string::npos);
+    CHECK(!parse({"--boost", "-3"}, loud, error));
 
     CHECK_NEAR(defaults.deemphasis_us, 75.0, 1e-12);
 

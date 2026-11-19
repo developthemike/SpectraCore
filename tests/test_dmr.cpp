@@ -579,7 +579,7 @@ TEST(listener_plays_only_dmr_when_asked)
     Pipeline pipeline(options);
     pipeline.start();
     Listener& listener = pipeline.listener();
-    listener.set_volume(0.0f);
+    listener.set_volume(1.0f);  // the plot shows the audio as played (no sound card here: silent all the same)
     listener.set_dmr_only(true);
     listener.set_enabled(true);
 

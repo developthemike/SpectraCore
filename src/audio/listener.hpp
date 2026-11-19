@@ -8,7 +8,8 @@
 // a P25Phase2Decoder, their voice frames to the AMBE+2 or IMBE decoder, and
 // the speech takes the place of the FM audio (silence while there is none, or
 // no vocoder).  The systems P25 control channels announce are remembered: a
-// Phase 2 voice channel can only be read knowing its system.
+// Phase 2 voice channel can only be read knowing its system.  The speech can
+// also go, an over at a time, to a VoiceOverSink: for speech to text.
 //
 // While nobody listens there is no tap, and none of this costs anything.
 //
@@ -24,6 +25,7 @@
 #include "audio/audio_fifo.hpp"
 #include "audio/audio_scope.hpp"
 #include "audio/scanner.hpp"
+#include "audio/voice_overs.hpp"
 #include "dsp/dmr_decoder.hpp"
 #include "dsp/fm_demod.hpp"
 #include "dsp/p25_decoder.hpp"
@@ -74,6 +76,7 @@ public:
     static constexpr double kMinWideBandwidth   = 100e3;
     static constexpr double kMaxWideBandwidth   = FmDemodulator::kWideMaxBandwidth;
     static constexpr double kDefaultBandwidth   = FmDemodulator::kNarrowDefaultBandwidth;
+    static constexpr float  kMaxBoostDb         = 20.0f;  // set_boost()
     static bool valid_bandwidth(double hz)
     {
         return (hz >= kMinNarrowBandwidth && hz <= kMaxNarrowBandwidth) ||
@@ -111,6 +114,11 @@ public:
     void set_deemphasis(double seconds);     // wideband FM: 75e-6 or 50e-6
     void set_squelch(float threshold_dbfs);  // FmDemodulator::kSquelchOff: always open
     void set_volume(float volume);           // 0 ... 1
+    // Amplifies the audio played beyond full volume, by 0 ... kMaxBoostDb dB;
+    // what would then go past full scale is limited rather than clipped (see
+    // PeakLimiter).  The plot shows it boosted, as played; the levels and the
+    // voice sink are not boosted.
+    void set_boost(float db);
     void set_muted(bool muted);              // silence without stopping (the audio keeps flowing)
     // Play DMR voice only: whatever else the channel carries - analog audio,
     // other digital modes - stays silent.  With P25 only as well, both play.
@@ -119,12 +127,17 @@ public:
     // P25 Phase 2: which of the two calls on a channel to hear (0 or 1);
     // -1: the first to speak.
     void set_p25_phase2_slot(int slot);
+    // Where the digital voice heard goes, an over at a time (see VoiceOvers);
+    // nullptr: nowhere.  It is called from the audio thread, and must outlive
+    // the listener's stop() - or the next call of this.
+    void set_voice_sink(VoiceOverSink* sink) { voice_sink_.store(sink, std::memory_order_release); }
 
     ListenStatus status() const;
 
     // Where the audio goes: mono, kAudioRate samples per second.
     AudioFifo& audio() { return fifo_; }
-    // The last seconds of it as played, before the volume control: for a plot.
+    // The last seconds of it as played - after the volume control, and any
+    // boost - for a plot.
     const AudioScope& scope() const { return scope_; }
 
     // ScanReceiver: what a Scanner drives.
@@ -150,6 +163,7 @@ private:
         double   deemphasis  = FmDemodulator::kDefaultDeemphasis;
         float    squelch     = FmDemodulator::kSquelchOff;
         float    volume      = 0.5f;
+        float    boost       = 1.0f;  // as a factor
         bool     muted       = false;
         bool     dmr_only    = false;
         bool     p25_only    = false;
@@ -173,6 +187,7 @@ private:
     Params                params_;
     std::atomic<uint64_t> generation_{0};
     std::atomic<bool>     enabled_{false};
+    std::atomic<VoiceOverSink*> voice_sink_{nullptr};
 
     std::thread       thread_;
     std::atomic<bool> stop_{false};

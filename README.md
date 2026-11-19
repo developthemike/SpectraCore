@@ -41,7 +41,13 @@ in the 3D view with the control panel, as a 2D waterfall, and as a spectrum.
   access code, and the voice of a clear call through the AMBE+2 or IMBE
   vocoder (an optional part of the build, see [Digital voice](#digital-voice)).
   On a P25 trunked system's control channel it can **follow the calls** it
-  grants to their voice channels and back.
+  grants to their voice channels and back; given a list of the system's
+  control channels, it finds the one on the air, and looks again when that
+  one is lost.
+- **Speech to text**: what is said in DMR and P25 calls can be written out,
+  with who said it, by OpenAI's Whisper running on the computer itself
+  through whisper.cpp (an optional part of the build, see
+  [Speech to text](#speech-to-text)).
 - **Scanning**: or let it find the signals. It stops on each one above a
   threshold, works out whether it is narrowband or wideband FM, stays while it
   is on the air, then moves on to the next.
@@ -84,6 +90,7 @@ SHA-256 hashes; nothing is installed system-wide):
 | Dear ImGui | — | always fetched and compiled in |
 | miniaudio (sound output) | — | always fetched and compiled in |
 | mbelib-neo (DMR and P25 voice) | — | fetched and compiled in only with `SPECTRO_WITH_MBELIB=ON` |
+| whisper.cpp (speech to text) | — | fetched and compiled in only with `SPECTRO_WITH_WHISPER=ON` |
 
 Sound goes out through PulseAudio / PipeWire, ALSA or JACK, whichever is
 running; building needs none of their development packages.
@@ -99,6 +106,7 @@ CMake options:
 | `SPECTRO_WITH_RTLSDR` | `ON` | `OFF` builds without RTL-SDR support |
 | `SPECTRO_WITH_AUDIO` | `ON` | `OFF` builds without sound output (signals cannot be listened to) |
 | `SPECTRO_WITH_MBELIB` | `OFF` | `ON` decodes DMR and P25 voice with mbelib-neo; read [Digital voice](#digital-voice) first |
+| `SPECTRO_WITH_WHISPER` | `OFF` | `ON` can write out the DMR and P25 voice as text with whisper.cpp; see [Speech to text](#speech-to-text) |
 | `SPECTRO_BUILD_TESTS` | `ON` | Build the unit tests (`ctest --test-dir build`) |
 | `SPECTRO_NATIVE_ARCH` | `ON` | Compile for this machine's CPU (`-march=native`) |
 | `SPECTRO_FETCH_MISSING` | `ON` | Allow downloading the dependencies listed above |
@@ -138,6 +146,46 @@ Without it everything else about DMR and P25 still works: the calls, their
 IDs and whether they are encrypted are shown, and the channel is silent
 instead of playing voice.
 
+### Speech to text
+
+The voice of DMR and P25 calls can be written out as text by OpenAI's
+[Whisper](https://github.com/openai/whisper) speech recogniser, run on the
+CPU by [whisper.cpp](https://github.com/ggml-org/whisper.cpp). It all
+happens on the computer: no audio is sent anywhere. Build with
+
+```sh
+cmake -S . -B build -G Ninja -DSPECTRO_WITH_MBELIB=ON -DSPECTRO_WITH_WHISPER=ON
+```
+
+which downloads whisper.cpp 1.9.5 (pinned and checked against its SHA-256
+hash, like the other downloads) and compiles it in, for the CPU only. It is
+MIT licensed. Speech to text needs the vocoders too (above): without them
+there is no voice to write out.
+
+Whisper also needs a model: a file of a few hundred megabytes, not part of
+the build. Download one of [whisper.cpp's
+models](https://huggingface.co/ggerganov/whisper.cpp/tree/main), for example
+
+```sh
+mkdir -p ~/whisper
+curl -L -o ~/whisper/ggml-small.en.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
+```
+
+and start the program with `--transcribe ~/whisper/ggml-small.en.bin` (see
+[Transcripts](#transcripts)). The bigger the model, the better it makes out
+poor audio, and the slower it is. Timed on a 7.7-second P25 Phase 2 call
+received with errors, on 8 threads of an Intel i7-12700H:
+
+| Model | Size | Time | What it made of the call |
+| --- | --- | --- | --- |
+| `ggml-base.en.bin` | 148 MB | 0.9 s | the gist, with many words misheard |
+| `ggml-small.en.bin` | 488 MB | 2.2 s | most of it, a few names and numbers wrong (recommended) |
+| `ggml-large-v3-turbo-q5_0.bin` | 574 MB | 9.9 s | a little more than small.en, but slower than the speech itself |
+
+The `.en` models know only English. For other languages take one without
+it (such as `ggml-small.bin`) and set `--transcribe-language`.
+
 ## Running
 
 ```sh
@@ -171,9 +219,12 @@ option; the most useful ones:
 | `--listen HZ`, `--listen-bw HZ` | Play the FM signal at this frequency, in a channel this wide: 5k to 25k is narrowband FM (default 12.5k), 100k to 300k wideband |
 | `--deemphasis 75\|50` | Wideband FM de-emphasis in µs: 75 (the Americas, South Korea; default) or 50 (elsewhere) |
 | `--volume PCT`, `--squelch DB` | Audio volume (default 50) and squelch threshold in dBFS (default off) |
+| `--boost DB` | Amplify the audio beyond full volume, by up to 20 dB (default 0); see [Listening to FM](#listening-to-fm) |
 | `--scan`, `--scan-threshold DB`, `--scan-hang SEC` | Listen by scanning; the level a signal must reach (default: 15 dB above the noise) and how long to wait when it stops (default 2 s) |
 | `--dmr-only`, `--p25-only`, `--dmr-hold SEC` | Play only DMR or P25 voice, and scanning, stay only for it; how long to wait on such a channel for a call (default 5 s) |
 | `--follow-calls` | On a P25 control channel, follow each call it grants to its voice channel and back (see [P25](#p25)) |
+| `--control-channels FILE` | P25 control channels to look for, a JSON list: with P25 only, scanning tries each until one is heard, follows its calls, and looks again when it is lost (see [Control channel lists](#control-channel-lists)) |
+| `--transcribe MODEL`, `--transcript-file PATH` | Write out what is said in DMR and P25 calls with this Whisper model, and also append it to a file (see [Transcripts](#transcripts)) |
 | `--headless --duration SEC` | No window: print stream statistics (see below) |
 
 File playback understands `sc16` (the bladeRF's own format, as written by
@@ -206,10 +257,10 @@ hold Ctrl and click a signal in the plot to hear that one instead. A box marks
 the channel being played. It is as wide as the channel
 filter, as deep as the history and as tall as the level scale. It is bright
 while there is something to hear and dim while the squelch mutes it. A small
-window next to the plot sets the frequency, the channel width, the volume and
-the squelch. It also plots the audio being played as a time series, before
-the volume control: the waveform over 20 or 100 ms, or how loud it has been
-over the last 1 or 5 s.
+window next to the plot sets the frequency, the channel width, the volume (and
+a boost beyond it) and the squelch. It also plots the audio as played - after
+the volume control and any boost - as a time series: the waveform over 20 or
+100 ms, or how loud it has been over the last 1 or 5 s.
 
 - **A click finds the carrier.** One column of the display often spans more
   than a channel (10 kHz at 20 MS/s), and a hand is not much more precise. So
@@ -233,6 +284,13 @@ over the last 1 or 5 s.
 - **Squelch**: the window shows the power in the channel, in dBFS like the
   plot. Set the threshold a few dB above the level of the empty channel; "off"
   plays the noise too.
+- **Boost**: quiet voice, analog or decoded, can be amplified beyond full
+  volume, by up to 20 dB (the Boost slider under the volume, or `--boost`).
+  What would then go past full scale is not clipped, which would distort it:
+  the level is turned down at once, by as much as needed, and back up over
+  about 0.2 s. An overdeviated signal is treated the same way without a
+  boost. The plot shows the audio boosted, as it is played; the levels and
+  the transcripts are not boosted.
 - **DMR only**, **P25 only**: play nothing but voice of that system (with
   both ticked, of either); analog audio and other digital modes stay silent,
   and a scan moves on from them. See [DMR](#dmr) and [P25](#p25).
@@ -370,8 +428,10 @@ listening window gets a P25 section:
   possible to a frequency that holds both channels, so the next call needs no
   retune. A call that is not found on its channel within two seconds is
   given up on. Tuning anywhere else by hand stops following until the
-  listener comes to a control channel again; it is paused while scanning.
-  Each step is logged ("P25: Following TG 200 on 851.01250 MHz, slot 2").
+  listener comes to a control channel again; it is paused while scanning
+  for signals. Each step is logged ("P25: Following TG 200 on 152.31250 MHz,
+  slot 2"). Given the frequencies the system's control channel may be on, it
+  can find the control channel too: see [Control channel lists](#control-channel-lists).
 - The simulator has a P25 radio 0.14 x the sample rate above its starting
   frequency (2439.8 MHz), on the air only for a group call (TG 100 from 2001)
   four seconds into every 12 seconds; 37.5 kHz above it (2439.8375 MHz) the
@@ -380,6 +440,100 @@ listening window gets a P25 section:
   the same system, with a group call (TG 200 from 3001) on slot 2 eight
   seconds into every 12. The control channel grants both calls: listen to it
   with Follow calls ticked to see them followed.
+
+#### Control channel lists
+
+A P25 site sends its control channel on one of a few frequencies, and moves
+it to another now and then (when a transmitter fails, or for maintenance);
+and a system has several sites. Given the frequencies to look on, the program
+finds the control channel on the air, follows its calls, and when it goes
+quiet, looks again:
+
+```sh
+./build/spectrogram --source rtlsdr --freq 154M --p25-only --control-channels county.json --scan
+```
+
+```json
+{
+  "control_channels": [153.3375, 153.4375, "154.2375 MHz", 154662500]
+}
+```
+
+- **The file** is a JSON object with an array `"control_channels"`, or just
+  the array. A frequency is a number or a string: below 1 000 000 it is
+  taken as MHz, otherwise as Hz, and a string may also give its unit
+  (`"153.8125 MHz"`, `"153812.5k"`). A trunk-recorder `config.json` works as
+  it is: the `control_channels` of its systems of type `p25` are taken, those
+  of other systems left out. The file is read when the program starts, and a
+  mistake in it stops it there, naming the line
+  (`--control-channels: county.json: line 4: expected ',' or ']'`). Channels
+  the radio cannot tune to are left out, with a warning.
+- **With P25 only ticked, scanning goes through the list** instead of the
+  spectrum (the check box then reads "Scan control channels"): each channel
+  in turn, in the order of the file, for 1.5 s from when the receiver gets
+  there, until one of them is heard to be a control channel. A control
+  channel sends all the time and is recognised within a fraction of a
+  second, so 1.5 s leaves a weak one time to show.
+- **Then its calls are followed**, as with Follow calls (which it ticks):
+  each call to its voice channel, and back.
+- **When the control channel is lost** - not heard for 2 s more than the
+  decoder's own second, 3 s in all, counted only while the receiver is on it
+  (not during a call) - the scan goes on from the next channel of the list,
+  round to the first: a control channel that had only faded is found again
+  when its turn comes.
+- The radio is retuned when the channel to try lies outside the band
+  received: where possible so that the whole list fits in the band, and
+  trying the rest needs no more retuning (an RTL-SDR at 2.4 MS/s holds a
+  list that spans up to about 2 MHz).
+- The listening window shows the channel being tried ("Trying 153.43750 MHz
+  (2 of 4)"), or that a control channel was heard, and below it what is
+  being followed. Skip (`N`) tries the next channel at once. Turning
+  scanning off (`S`) stays on the control channel and goes on following its
+  calls, but no longer looks again when it is lost; turning Follow calls
+  off, or choosing a channel by hand, ends both. P25 only switches scanning
+  between the list and the spectrum.
+- It is logged when a control channel is heard ("P25: control channel at
+  153.43750 MHz (2 of 4 listed): following its calls") or lost, and once
+  when a whole round of the list has passed without one; `--verbose` also
+  logs each channel tried.
+
+#### Transcripts
+
+Started with `--transcribe MODEL` (in a build with speech to text, see
+[Speech to text](#speech-to-text)), the program writes out what is said in
+the DMR and P25 calls it plays:
+
+- **An over at a time**: one radio's transmission, from its first voice
+  frame to its last, is written out once it ends: when its call does, when
+  another radio takes over, or when nothing has been said for 0.6 s. An over
+  longer than 28 s is written out in parts. What is not played (encrypted
+  calls, or what DMR only and P25 only leave out) is not written out either.
+- **The Transcript window**, beside the listening window, lists them, the
+  latest at the top: the time, who spoke (talkgroup and radio, as the call's
+  signalling named them) and what was said. Hover over the time for the
+  frequency, system, slot and length. Text Whisper was unsure of (under 50 %
+  confidence) is dimmed. "Copy" copies the whole list, "Clear" empties it,
+  and unticking "Transcribe" stops writing out until it is ticked again. The
+  Transcript box next to Follow calls brings the window back once it has
+  been closed.
+- Each transcript is also **logged** in the terminal, and with
+  `--transcript-file PATH` appended to that file, a line each:
+  `2026-11-17 21:19:19  154.16250 MHz  P25 Phase 2 slot 1  TG 200 from 3001  (4.2 s): Engine 5, on scene.`
+- The model loads in the background as the program starts. Whisper runs on
+  a thread of its own, using half the CPU's cores (up to 8), so the radio and
+  the sound are not held up; an over is usually written out a second or two
+  after it ends. Overs that come faster than they can be written out wait
+  their turn; with more than 16 waiting, the oldest are dropped (the window
+  counts them).
+- **Expect mistakes.** Whisper hears vocoded radio speech well when the
+  signal is clean: a recording of speech passed through the AMBE+2 vocoder
+  comes out nearly word for word. But the lost and damaged voice frames of a
+  weak signal leave it guessing, and names, street names and numbers suffer
+  first; a bigger model guesses better. The notes Whisper makes of what is
+  not speech ("[BLANK_AUDIO]", "(static)") are left out, as is a word it
+  repeats over and over when it gets stuck.
+- `--transcribe-language CODE` sets the language (`en` by default; `auto`
+  lets Whisper decide for each over, which short noisy overs often throw).
 
 #### Scanning
 
@@ -407,6 +561,10 @@ scanner looks for signals itself:
   A DMR or P25 call keeps it until the call ends, even through a fade; with
   DMR only or P25 only, it also moves on from whatever is not voice of that
   system (see [DMR](#dmr) and [P25](#p25)).
+- **P25 control channels**: with P25 only ticked and a list of control
+  channels given (`--control-channels`), scanning goes through that list
+  instead of the spectrum, and follows the calls of the control channel it
+  finds (see [Control channel lists](#control-channel-lists)).
 - **Skipping**: `N` (or "Skip") moves on at once and leaves that signal out
   while the rest of the list is gone through, e.g. a steady carrier or an
   interference spur, which would otherwise hold the scanner for good. Skipping
@@ -428,7 +586,7 @@ scanner looks for signals itself:
 | Ctrl + drag | Slide the channel being listened to |
 | `L` | Sound on / off (it starts by scanning for signals) |
 | `S` | Scanning on / off |
-| `N` | Skip to the next signal while scanning |
+| `N` | Skip to the next signal (or control channel) while scanning |
 | `1` / `2` / `3` | 3D view / top view (2D waterfall) / front view (spectrum) |
 | `←` / `→` | Tune down / up by 1/20 of the span (Shift: 1/200, Ctrl: half the span) |
 | `↑` / `↓` | Gain up / down (Shift: 5 dB steps) |
@@ -490,6 +648,11 @@ validation layers if they are installed (`vulkan-validationlayers`).
 ctest --test-dir build --output-on-failure        # unit tests
 ```
 
+In a build with speech to text, one test transcribes a recording of speech
+that comes with whisper.cpp, as it is and through the AMBE+2 vocoder; it
+runs when `SPECTRO_WHISPER_MODEL` names a model
+(`SPECTRO_WHISPER_MODEL=~/whisper/ggml-base.en.bin ctest --test-dir build`).
+
 ## How it works
 
 ```
@@ -550,14 +713,16 @@ src/dsp/      windows, SpectrumEngine (FFT, averaging, rows), FM demodulator (na
               signal classifier, 4FSK front end; DMR, P25 Phase 1 and Phase 2 (coding, decoder,
               transmitter for the simulator), P25 trunking; AMBE+2 and IMBE vocoder wrapper
 src/audio/    listening: audio thread, audio FIFO, rate matching, sound output, scanner, digital voice
-              playout, channels heard, following P25 calls
+              playout, channels heard, following P25 calls and hunting for their control channel
+              (and the list of them), voice overs and speech to text
 src/gfx/      Vulkan context and swapchain, renderer, camera, colour maps, PNG writer
 src/ui/       Dear ImGui integration; 3D axes, grid and labels
 src/app/      command line, pipeline wiring, the interactive application, headless mode
-src/util/     lock-free IQ ring buffer, logging, units, small 3D math
+src/util/     lock-free IQ ring buffer, logging, units, small 3D math, a small JSON reader
 shaders/      GLSL, compiled to SPIR-V and embedded in the executable at build time
 tests/        unit tests of the ring buffer, DSP, sources, demodulator, audio path, signal recognition,
-              DMR, P25 Phase 1 and 2, following calls, and option parsing
+              DMR, P25 Phase 1 and 2, following calls and hunting for control channels, speech to
+              text, JSON, and option parsing
 tools/        gen_colormaps.py, which regenerates src/gfx/colormap_data.inc
 cmake/        dependency discovery and shader compilation
 ```
@@ -644,7 +809,8 @@ Ubuntu 26.04, Mesa 26:
   heard, up to 360 ms). Phase 2 needs a signalling burst without errors to
   work out its system, unless the system's control channel was heard (see
   [P25](#p25)). Following takes one call at a time, without priorities or a choice of
-  talkgroups, and only on a single site. Simulcast systems sending CQPSK
+  talkgroups, and on one site at a time (a list of control channels lets it
+  move to another site's once the one it is on is lost). Simulcast systems sending CQPSK
   (LSM) decode poorly, if at all, through an FM receiver; Phase 2 base
   stations send H-DQPSK, which is received through the FM demodulator as
   four frequency levels and decodes as long as the signal is clean.
@@ -674,7 +840,13 @@ Ubuntu 26.04, Mesa 26:
   decoded, about 96 % of them, of which a fifth had more errors than the
   vocoder could correct - at that spot the signal itself was rough (about
   20 degrees of phase noise per symbol, through the FM demodulator or
-  without). Following calls was tested with the simulator.
+  without). Following calls, and hunting for the control channel through a
+  list, were tested with the simulator only. Speech to text
+  was tried on that clear Phase 2 call (see [Speech to text](#speech-to-text)
+  for how the models did) and, end to end, on recorded speech through the
+  AMBE+2 vocoder.
+- Speech to text: DMR and P25 voice only, not analog FM; it is only as good
+  as Whisper's hearing of the speech (see [Transcripts](#transcripts)).
 
 ## Third-party software
 
@@ -686,6 +858,8 @@ Google) and Inferno, Magma, Plasma and Viridis (CC0) are taken from matplotlib.
 
 Optional, with `SPECTRO_WITH_MBELIB=ON`: mbelib-neo (GPL-2.0-or-later; the parts
 from the original mbelib ISC) and PFFFT (BSD-like), which it fetches.
+With `SPECTRO_WITH_WHISPER=ON`: whisper.cpp and ggml (MIT). The Whisper
+models it reads (MIT, OpenAI) are downloaded separately.
 
 Note that FFTW is licensed under the GPL: if you distribute binaries of this
 program, the GPL's terms apply to them.

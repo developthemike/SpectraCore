@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <numbers>
 #include <random>
@@ -13,6 +14,7 @@
 #include "app/pipeline.hpp"
 #include "audio/audio_fifo.hpp"
 #include "audio/audio_scope.hpp"
+#include "audio/limiter.hpp"
 #include "audio/listener.hpp"
 #include "audio/rate_control.hpp"
 #include "dsp/fm_demod.hpp"
@@ -511,6 +513,54 @@ TEST(audio_rate_follows_the_sound_card)
     CHECK(control.update(0.01, 48000 / 2, 480, true).discard);
 }
 
+TEST(peak_limiter_turns_down_only_what_would_clip)
+{
+    const auto sine = [](double amplitude, size_t count) {
+        std::vector<float> s(count);
+        for (size_t i = 0; i < count; ++i)
+            s[i] = static_cast<float>(amplitude * std::sin(kTwoPi * 1000.0 * static_cast<double>(i) / kAudioRate));
+        return s;
+    };
+    PeakLimiter limiter(kAudioRate);
+
+    // Within full scale: untouched.
+    const std::vector<float> within = sine(0.9, 4'800);
+    CHECK(std::all_of(within.begin(), within.end(), [&](float v) { return limiter.process(v) == v; }));
+    CHECK_EQ(limiter.reduction_db(), 0.0f);
+
+    // Three times full scale: turned down to full scale, and still a clean sine
+    // where clipping would square it off (4/pi of full scale at 1 kHz, a third
+    // of that at 3 kHz).
+    std::vector<float> loud = sine(3.0, 48'000);
+    for (float& v : loud)
+        v = limiter.process(v);
+    CHECK(std::all_of(loud.begin(), loud.end(), [](float v) { return std::fabs(v) <= 1.0f; }));
+    CHECK_NEAR(measure_tone(loud, 24'000, 4'800, 1000.0).amplitude, 1.0, 0.01);
+    CHECK(measure_tone(loud, 24'000, 4'800, 3000.0).amplitude < 0.01);
+    CHECK_NEAR(limiter.reduction_db(), 20.0 * std::log10(3.0), 0.1);
+
+    // Quiet again: the level is back within a second.
+    std::vector<float> after = sine(0.5, 48'000);
+    for (float& v : after)
+        v = limiter.process(v);
+    CHECK_NEAR(measure_tone(after, 43'200, 4'800, 1000.0).amplitude, 0.5, 0.005);
+    CHECK_EQ(limiter.reduction_db(), 0.0f);
+
+    // A sample just under the peak before - as the next peak of a busy signal
+    // can be, and every sample near the top of a low tone is - still comes
+    // out within full scale.
+    PeakLimiter  busy(kAudioRate);
+    const double release = std::exp(-1.0 / (PeakLimiter::kReleaseSeconds * kAudioRate));
+    busy.process(2.0f);
+    CHECK(std::fabs(busy.process(static_cast<float>(1.0 + release))) <= 1.0f);
+    bool contained = true;
+    for (size_t i = 0; i < 48'000; ++i) {
+        const double hum = 3.0 * std::sin(kTwoPi * 50.0 * static_cast<double>(i) / kAudioRate);
+        contained        = contained && std::fabs(busy.process(static_cast<float>(hum))) <= 1.0f;
+    }
+    CHECK(contained);
+}
+
 TEST(listener_plays_the_simulators_voice_channel)
 {
     // End to end, except for the sound card: simulator -> receive thread ->
@@ -573,13 +623,40 @@ TEST(listener_plays_the_simulators_voice_channel)
         CHECK(played.size() > 19'200);
         if (played.size() > 19'200)
             CHECK(share_of_tune(std::vector<float>(played.end() - 19'200, played.end()), amplitude / 4.0) > 0.7);
-        // The plot shows the audio before the volume control: still full size.
+        // The plot shows the audio as played: a quarter of the size too.
         {
             std::vector<float> plotted(24'000);
             CHECK_EQ(listener.scope().latest(plotted.data(), plotted.size()), plotted.size());
-            CHECK(share_of_tune(plotted, amplitude) > 0.7);
+            CHECK(share_of_tune(plotted, amplitude / 4.0) > 0.7);
         }
         listener.set_volume(1.0f);
+
+        // A boost of 6 dB doubles the amplitude.  One of 20 dB would take the
+        // tune to three times full scale: the limiter keeps it at full scale,
+        // without clipping it - in the plot too.
+        const auto played_with_boost = [&](float db) {
+            listener.set_boost(db);
+            wait_ms(400);
+            card.take();
+            wait_ms(500);
+            const std::vector<float> all = card.take();
+            return all.size() > 19'200 ? std::vector<float>(all.end() - 19'200, all.end()) : std::vector<float>{};
+        };
+        const std::vector<float> doubled = played_with_boost(6.0f);
+        const std::vector<float> limited = played_with_boost(20.0f);
+        std::printf("    boosted: %.2f of the tune at twice the amplitude (+6 dB), %.2f at full scale (+20 dB)\n",
+                    share_of_tune(doubled, 2.0 * amplitude), share_of_tune(limited, 1.0));
+        CHECK(share_of_tune(doubled, 2.0 * amplitude) > 0.7);
+        CHECK(share_of_tune(limited, 1.0) > 0.7);
+        CHECK(!limited.empty() &&
+              std::all_of(limited.begin(), limited.end(), [](float v) { return std::fabs(v) <= 1.0f; }));
+        {
+            std::vector<float> plotted(24'000);
+            CHECK_EQ(listener.scope().latest(plotted.data(), plotted.size()), plotted.size());
+            CHECK(share_of_tune(plotted, 1.0) > 0.7);
+            CHECK(std::all_of(plotted.begin(), plotted.end(), [](float v) { return std::fabs(v) <= 1.0f; }));
+        }
+        listener.set_boost(0.0f);
 
         // Tuned 4 kHz off, as after a click on a coarse display, with a search
         // of 5 kHz: it finds the carrier and centres the channel on it.

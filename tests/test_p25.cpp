@@ -436,7 +436,7 @@ TEST(listener_decodes_the_simulators_p25)
     Pipeline pipeline(options);
     pipeline.start();
     Listener& listener = pipeline.listener();
-    listener.set_volume(0.0f);
+    listener.set_volume(1.0f);    // the plot shows the audio as played (no sound card here: silent all the same)
     listener.set_dmr_only(true);  // to start with: P25 is not to be heard
     listener.set_enabled(true);
     listener.tune(150e6 + SimSource::digital_stations(2.4e6)[2].offset_hz, 0.0, 12.5e3);
@@ -540,15 +540,15 @@ TEST(p25_control_messages_are_understood)
     P25Site               site;
     std::vector<P25Grant> grants;
     CHECK(apply_tsbk(tsbk::network_status(0xBEE01, 0x2A3, 0), site, grants, 0.0));
-    CHECK(apply_tsbk(tsbk::channel_plan(1, 851.00625e6, 12.5e3, -45e6), site, grants, 0.0));
+    CHECK(apply_tsbk(tsbk::channel_plan(1, 155.1375e6, 12.5e3, -4e6), site, grants, 0.0));
     CHECK(apply_tsbk(tsbk::channel_plan_vhf_uhf(2, 450.0e6, 6.25e3, 5e6), site, grants, 0.0));
     CHECK(apply_tsbk(tsbk::rfss_status(0x2A3, 3, 7, 0x1028), site, grants, 0.0));
     CHECK_EQ(site.wacn, 0xBEE01);
     CHECK_EQ(site.system, 0x2A3);
     CHECK_EQ(site.rfss, 3);
     CHECK_EQ(site.site, 7);
-    CHECK_NEAR(site.control_hz, 851.00625e6 + 40 * 12.5e3, 1e-3);
-    CHECK_NEAR(site.plans[1].tx_offset_hz, -45e6, 1e-3);
+    CHECK_NEAR(site.control_hz, 155.1375e6 + 40 * 12.5e3, 1e-3);
+    CHECK_NEAR(site.plans[1].tx_offset_hz, -4e6, 1e-3);
     CHECK_NEAR(site.plans[2].tx_offset_hz, 5e6, 1e-3);
     CHECK(!site.phase2());
 
@@ -560,16 +560,16 @@ TEST(p25_control_messages_are_understood)
     CHECK(!grants[0].group && grants[0].destination == 1234567u && grants[0].source == 7654321u);
     const auto tg100 = std::find_if(grants.begin(), grants.end(), [](const P25Grant& g) { return g.destination == 100; });
     CHECK(tg100 != grants.end() && tg100->source == 2001u && tg100->encrypted && tg100->slot == -1);
-    CHECK(tg100 != grants.end() && std::fabs(tg100->frequency - (851.00625e6 + 5 * 12.5e3)) < 1e-3);
+    CHECK(tg100 != grants.end() && std::fabs(tg100->frequency - (155.1375e6 + 5 * 12.5e3)) < 1e-3);
     const auto tg200 = std::find_if(grants.begin(), grants.end(), [](const P25Grant& g) { return g.destination == 200; });
     CHECK(tg200 != grants.end() && std::fabs(tg200->frequency - (450.0e6 + 16 * 6.25e3)) < 1e-3);
 
     // A TDMA plan: two slots per carrier, so voice in Phase 2.
-    CHECK(apply_tsbk(tsbk::channel_plan_tdma(3, 3, 769.0e6, 12.5e3, 30e6), site, grants, 4.0));
+    CHECK(apply_tsbk(tsbk::channel_plan_tdma(3, 3, 151.8375e6, 12.5e3, 7e6), site, grants, 4.0));
     CHECK(site.phase2());
     CHECK(apply_tsbk(tsbk::group_grant(0x3009, 300, 5), site, grants, 5.0));
     CHECK_EQ(grants[0].slot, 1);
-    CHECK_NEAR(grants[0].frequency, 769.0e6 + 4 * 12.5e3, 1e-3);
+    CHECK_NEAR(grants[0].frequency, 151.8375e6 + 4 * 12.5e3, 1e-3);
     CHECK(p25_grant_destination(grants[0]) == "TG 300");
 }
 
@@ -583,7 +583,7 @@ TEST(p25_decoder_reads_a_control_channel)
         tx.control([&n] {
             switch (n++ % 4) {
             case 0: return tsbk::network_status(0xBEE01, 0x2A3, 0x1028);
-            case 1: return tsbk::channel_plan(1, 851.00625e6, 12.5e3, -45e6);
+            case 1: return tsbk::channel_plan(1, 155.1375e6, 12.5e3, -4e6);
             case 2: return tsbk::rfss_status(0x2A3, 1, 4, 0x1028);
             default: return tsbk::group_grant(0x1005, 100, 2001);
             }
@@ -600,7 +600,7 @@ TEST(p25_decoder_reads_a_control_channel)
         CHECK_EQ(s.site.site, 4);
         CHECK(s.site.plans[1].known);
         CHECK(!s.grants.empty() && s.grants[0].destination == 100u && s.grants[0].source == 2001u &&
-              std::fabs(s.grants[0].frequency - 851.06875e6) < 1.0);
+              std::fabs(s.grants[0].frequency - 155.2e6) < 1.0);
         // Most blocks get through: about 2 s worth.
         const uint64_t expected = static_cast<uint64_t>(1.8 * 4800.0 / (56.0 + 98.0 * per_tsdu + 4.0) * per_tsdu);
         std::printf("    %d to a TSDU: %llu blocks (about %llu sent), %s\n", per_tsdu,

@@ -22,6 +22,7 @@
 #include "app/signals.hpp"
 #include "audio/heard_channels.hpp"
 #include "audio/listener.hpp"
+#include "audio/transcriber.hpp"
 #include "audio/trunk_follower.hpp"
 #if SPECTRO_HAVE_AUDIO
 #include "audio/audio_output.hpp"
@@ -52,6 +53,9 @@ constexpr int kFftSizes[] = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 655
 constexpr double kNarrowWidthsHz[] = {8e3, 10e3, 12.5e3, 16e3, 20e3, 25e3};
 constexpr double kWideWidthsHz[]   = {100e3, 150e3, 200e3, 250e3};
 constexpr float  kSquelchSliderOff = -120.0f;
+
+// A transcript Whisper gave less confidence than this is shown dimmed.
+[[maybe_unused]] constexpr float kUnsureTranscript = 0.5f;
 
 // The audio plot: the spans on offer, and how far back to look for a zero
 // crossing to steady the short ones on.
@@ -85,6 +89,12 @@ struct ViewSettings {
     bool show_panel = true;
     bool show_help  = false;
 };
+
+// The trunk follower's clock, in seconds.
+double follow_clock()
+{
+    return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+}
 
 void glfw_error_callback(int code, const char* description)
 {
@@ -165,9 +175,18 @@ private:
     void start_scanning();
     void skip_signal();
     void stop_scanning();
-    bool scanning() const { return scanner_ && scanner_->active(); }
+    bool scanning() const { return scanner_ && scanner_->active(); }  // for signals, in the spectrum
     bool scan_locked() const;  // scanning and on a signal
+    // P25 only, with control channels from --control-channels: scanning goes
+    // through them instead (the trunk follower hunts), and follows the calls
+    // of the one heard.
+    bool channel_scan_wanted() const { return listen_.p25_only && !follower_.control_channels().empty(); }
+    bool channel_scanning() const { return follower_.hunting(); }
+    void start_channel_scan();
+    void use_control_channels(const std::vector<double>& listed);
+    double control_channels_centre(double hz) const;
     void listen_to(double hz, double search_hz);
+    void select_channel(double hz, double search_hz);
     void listen_to_heard(double hz, int phase2_slot = -1);
     void follow_to(const FollowAction& action);
     void set_following(bool on);
@@ -189,6 +208,8 @@ private:
     [[maybe_unused]] void draw_p25_status();  // likewise
     [[maybe_unused]] void draw_p25_phase2_status();  // likewise
     [[maybe_unused]] void draw_following();  // likewise
+    [[maybe_unused]] void draw_channel_scan();  // likewise
+    void draw_transcript_window();
     std::string           digital_filter_name() const;
     void draw_listen_label();
     void build_lines();
@@ -201,6 +222,9 @@ private:
     float       column_phase() const;
 
     Options  options_;
+    // Speech to text of the voice the listener decodes.  (Before the pipeline:
+    // the listener hands it the voice until the pipeline stops.)
+    std::unique_ptr<Transcriber> transcriber_;
     Pipeline pipeline_;
 
     std::unique_ptr<GlfwSession>               glfw_;
@@ -286,6 +310,7 @@ private:
         double bandwidth = Listener::kDefaultBandwidth;      // also chooses narrowband or wideband FM
         double deemphasis = FmDemodulator::kDefaultDeemphasis;  // wideband FM, seconds
         float  volume    = 0.5f;   // 0..1
+        float  boost_db  = 0.0f;   // beyond full volume, 0 ... Listener::kMaxBoostDb
         float  squelch   = FmDemodulator::kSquelchOff;  // dBFS
         bool   dmr_only  = false;  // play DMR voice only (and scanning, stay only for it)
         bool   p25_only  = false;  // likewise P25; with both, both
@@ -303,7 +328,11 @@ private:
     std::string              logged_p25_phases_;   // and its voice channels' kinds
     std::vector<std::string> logged_p25_grants_;   // and its grants (the latest few)
     HeardChannels            heard_;          // channels DMR voice has been heard on
+    std::vector<Transcript>  transcripts_;      // what was said, oldest first
+    uint64_t                 transcript_serial_ = 0;  // the latest of them
+    bool                     show_transcript_   = true;
     TrunkFollower            follower_;       // following a P25 system's calls
+    size_t                   hunt_tries_ = 0; // control channels tried since one was last heard
     std::string              logged_p25p2_[2];  // the P25 Phase 2 call on each slot, as logged
 
     // The audio plot in the listening window
@@ -429,6 +458,7 @@ App::App(const Options& options)
     // silently unless a volume was asked for.
     const double volume = !std::isnan(options_.volume) ? options_.volume : options_.self_test ? 0.0 : kDefaultVolume;
     listen_.volume      = static_cast<float>(volume / 100.0);
+    listen_.boost_db    = static_cast<float>(options_.boost_db);
     listen_.bandwidth   = options_.listen_bandwidth;
     listen_.deemphasis  = options_.deemphasis_us * 1e-6;
     listen_.scan_hang   = options_.scan_hang;
@@ -436,11 +466,28 @@ App::App(const Options& options)
     listen_.p25_only    = options_.p25_only;
     listen_.dmr_hold    = options_.dmr_hold;
     set_following(options_.follow_calls);
+    use_control_channels(options_.control_channels);
     if (!std::isnan(options_.scan_threshold))
         listen_.scan_threshold = static_cast<float>(options_.scan_threshold);
     scanner_ = std::make_unique<Scanner>(pipeline_.listener());
     if (!std::isnan(options_.squelch))
         listen_.squelch = static_cast<float>(options_.squelch);
+    // Speech to text: the model loads on the transcriber's own thread.
+    if (!options_.transcribe_model.empty()) {
+        if (!Transcriber::available()) {
+            LOG_WARN("--transcribe: this build has no speech to text (configure with -DSPECTRO_WITH_WHISPER=ON)");
+        } else {
+            if (!pipeline_.listener().status().vocoder)
+                LOG_WARN("--transcribe: this build has no vocoder, so there is no voice to transcribe "
+                         "(configure with -DSPECTRO_WITH_MBELIB=ON)");
+            Transcriber::Settings settings;
+            settings.model    = options_.transcribe_model;
+            settings.language = options_.transcribe_language;
+            settings.file     = options_.transcript_file;
+            transcriber_      = std::make_unique<Transcriber>(settings);
+            pipeline_.listener().set_voice_sink(transcriber_.get());
+        }
+    }
     if (options_.scan)
         start_scanning();
     if (!std::isnan(options_.listen_frequency)) {
@@ -565,8 +612,15 @@ void App::update_title()
 }
 
 // Skipping the last signal of the list goes round again from the first.
+// Scanning control channels, it tries the next of them.
 void App::skip_signal()
 {
+    if (channel_scanning()) {
+        const FollowAction action = follower_.skip(follow_clock());
+        if (action.tune)
+            follow_to(action);
+        return;
+    }
     if (scanner_ && scanner_->skip()) {
         LOG_INFO("Scanner: end of the list, starting again from the bottom");
         toast("End of the list: back to the first signal");
@@ -1039,18 +1093,23 @@ void App::self_test_check_audio(bool wide)
              audio_ ? audio_->description().c_str() : "nothing");
 
     // The audio plot shows what is played: the last half second of it must be
-    // as loud as the listener says.
+    // as loud as the listener says, times the volume and any boost - but no
+    // louder than a full-scale tone, where the limiter takes over.  (Silent,
+    // as the self-test is unless a volume is given.)
     std::vector<float> tail(static_cast<size_t>(Listener::kAudioRate / 2));
     const size_t       plotted = listener.scope().latest(tail.data(), tail.size());
     double             power   = 0.0;
     for (size_t i = 0; i < plotted; ++i)
         power += static_cast<double>(tail[i]) * tail[i];
     const double plotted_rms = plotted > 0 ? std::sqrt(power / static_cast<double>(plotted)) : 0.0;
+    const double played_gain = static_cast<double>(listen_.volume) * static_cast<double>(listen_.volume) *
+                               std::pow(10.0, static_cast<double>(listen_.boost_db) / 20.0);
+    const double played_rms  = std::min(static_cast<double>(status.audio_rms) * played_gain, 1.0 / std::sqrt(2.0));
 
     bool ok = listen_.on && status.in_band && !status.searching && status.dropped_iq == 0 &&
               (status.mode == FmMode::Wide) == wide &&
               status.audio_samples >= static_cast<uint64_t>(Listener::kAudioRate) / 2 && plotted == tail.size() &&
-              std::fabs(plotted_rms - status.audio_rms) < 0.25 * status.audio_rms + 0.02;
+              std::fabs(plotted_rms - played_rms) < 0.25 * played_rms + 0.02;
     const double fs = pipeline_.source().sample_rate();
     if (ok && options_.source.kind == "sim" && (!wide || fs >= SimSource::kBroadcastMinRate)) {
         // The carrier was found, and the tune comes out as loud as it should.
@@ -1462,14 +1521,14 @@ void App::handle_input()
     if (pressed(ImGuiKey_L))
         toggle_listening();
     if (pressed(ImGuiKey_S)) {
-        if (scanning()) {
+        if (scanning() || channel_scanning()) {
             stop_scanning();
             toast("Scanning off: staying on this channel");
         } else {
             start_scanning();
         }
     }
-    if (pressed(ImGuiKey_N) && scanning())
+    if (pressed(ImGuiKey_N) && (scanning() || channel_scanning()))
         skip_signal();
     if (pressed(ImGuiKey_P) || pressed(ImGuiKey_F12))
         take_screenshot({});
@@ -1539,6 +1598,7 @@ void App::set_listening(bool on)
     listener.set_bandwidth(listen_.bandwidth);
     listener.set_deemphasis(listen_.deemphasis);
     listener.set_volume(listen_.volume);
+    listener.set_boost(listen_.boost_db);
     listener.set_squelch(listen_.squelch);
     listener.set_dmr_only(listen_.dmr_only);
     listener.set_p25_only(listen_.p25_only);
@@ -1560,10 +1620,15 @@ void App::toggle_listening()
 }
 
 // Listens by scanning: the scanner finds the signals, the listener plays them.
+// (P25 only, with control channels to go through: see start_channel_scan().)
 void App::start_scanning()
 {
-    if (scanning())
+    if (scanning() || channel_scanning())
         return;
+    if (channel_scan_wanted()) {
+        start_channel_scan();
+        return;
+    }
     // Without a threshold the scanner waits until it knows the noise floor
     // (see update_listening()), and takes nothing before.
     constexpr float kNothingYet = 1e9f;
@@ -1586,6 +1651,83 @@ void App::stop_scanning()
 {
     if (scanner_)
         scanner_->stop();  // the listener stays where it is
+    follower_.stop_hunting();  // likewise; a control channel it is on is still followed
+}
+
+// Scanning the control channels: the trunk follower tries them in turn until
+// one is heard, follows its calls, and when it is lost looks again.
+void App::start_channel_scan()
+{
+    set_listening(true);
+    if (!listen_.on)
+        return;
+    listen_.selected = true;
+    set_following(true);
+    hunt_tries_               = 0;
+    const FollowAction action = follower_.hunt(listen_.frequency, follow_clock());
+    if (follower_.state() == TrunkFollower::State::Hunting)
+        LOG_INFO("P25: looking for a control channel, %zu listed", follower_.control_channels().size());
+    if (action.tune)
+        follow_to(action);
+    toast("Scanning the control channels (S: stop, N: next)");
+}
+
+// The control channels of --control-channels: those this radio can receive
+// are the ones scanning goes through.
+void App::use_control_channels(const std::vector<double>& listed)
+{
+    if (listed.empty())
+        return;
+    const IqSource&   source = pipeline_.source();
+    const SourceInfo& info   = source.info();
+    const double      fs     = source.sample_rate();
+    std::vector<double> usable;
+    for (const double hz : listed) {
+        // A radio that cannot be tuned receives only the band it is on.
+        const bool reachable = info.tunable ? hz >= info.frequency_range.min && hz <= info.frequency_range.max
+                                            : std::fabs(hz - source.frequency()) + 0.5 * Listener::kDefaultBandwidth <=
+                                                  0.45 * fs;
+        if (reachable)
+            usable.push_back(hz);
+        else
+            LOG_WARN("--control-channels: %s is out of this radio's reach; left out", format_frequency(hz).c_str());
+    }
+    follower_.set_control_channels(usable);
+    if (usable.empty()) {
+        LOG_WARN("--control-channels: none of them can be received here");
+        return;
+    }
+    std::string list;
+    for (const double hz : usable) {
+        char text[32];
+        std::snprintf(text, sizeof(text), "%s%.5f", list.empty() ? "" : ", ", hz / 1e6);
+        list += text;
+    }
+    LOG_INFO("P25: %zu control channel(s) to look for: %s MHz%s", usable.size(), list.c_str(),
+             options_.p25_only ? "" : " (scanning goes through them with P25 only)");
+}
+
+// A centre frequency for the radio that holds `hz` and every control channel
+// of the list - so that looking through them needs no more retuning - with
+// none of them on the DC spike in the middle; NaN if there is none.
+double App::control_channels_centre(double hz) const
+{
+    const std::vector<double>& listed = follower_.control_channels();
+    if (listed.empty())
+        return std::numeric_limits<double>::quiet_NaN();
+    const auto [lowest, highest] = std::minmax_element(listed.begin(), listed.end());
+    const double middle = 0.5 * (std::min(*lowest, hz) + std::max(*highest, hz));
+    const double fs     = pipeline_.source().sample_rate();
+    const double width  = Listener::kDefaultBandwidth;
+    for (const double shift : {0.0, 1.0, -1.0, 2.0, -2.0}) {
+        const double centre = middle + shift * width;
+        const auto   fits   = [&](double f) {
+            return std::fabs(f - centre) + 0.5 * width <= 0.45 * fs && std::fabs(f - centre) >= width;
+        };
+        if (fits(hz) && std::all_of(listed.begin(), listed.end(), fits))
+            return centre;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
 }
 
 bool App::scan_locked() const
@@ -1630,34 +1772,54 @@ void App::set_following(bool on)
     follower_.set_enabled(on);
 }
 
-// Where the follower says to go: a call's voice channel, or back to the
-// control channel.  If it lies outside the band received the radio is
-// retuned - where possible so that both channels fit, and the next call
-// needs none.
+// Where the follower says to go: a call's voice channel, back to the control
+// channel, or the next control channel of the list to try.  If it lies
+// outside the band received the radio is retuned - where possible so that
+// the control channel fits too, and the next call needs no retune; or so
+// that all the control channels of the list do, and the next try needs none.
 void App::follow_to(const FollowAction& action)
 {
     IqSource&    source = pipeline_.source();
     const double fs     = source.sample_rate();
     const double width  = Listener::kDefaultBandwidth;
     const auto   fits   = [&](double centre, double hz) { return std::fabs(hz - centre) + 0.5 * width <= 0.45 * fs; };
+    const TrunkFollower::State state = follower_.state();
     if (!fits(source.frequency(), action.frequency)) {
         if (!source.info().tunable) {
             toast("The call is outside the band received, and this source cannot be tuned: not following calls");
             set_following(false);
             return;
         }
-        const double control = follower_.control_frequency();
-        const double both    = 0.5 * (action.frequency + control);
-        tune_to(fits(both, action.frequency) && fits(both, control) ? both : action.frequency - 0.25 * fs);
+        // Otherwise the channel a quarter of the band above the centre, clear of the DC spike.
+        double centre = action.frequency - 0.25 * fs;
+        if (state == TrunkFollower::State::Voice) {
+            const double control = follower_.control_frequency();
+            const double both    = 0.5 * (action.frequency + control);
+            if (fits(both, action.frequency) && fits(both, control))
+                centre = both;
+        } else if (const double all = control_channels_centre(action.frequency); !std::isnan(all)) {
+            centre = all;
+        }
+        tune_to(centre);
     }
     listen_.bandwidth = width;
     pipeline_.listener().set_bandwidth(width);
-    listen_to(action.frequency, 0.0);
+    select_channel(action.frequency, 0.0);  // (without ending a scan of the control channels)
     pipeline_.listener().set_p25_phase2_slot(action.slot);
-    if (follower_.state() == TrunkFollower::State::Voice)
+    switch (state) {
+    case TrunkFollower::State::Voice:
         LOG_INFO("P25: %s", follower_.describe().c_str());
-    else
+        break;
+    case TrunkFollower::State::Hunting:
+        LOG_DEBUG("P25: %s", follower_.describe().c_str());
+        if (++hunt_tries_ == follower_.control_channels().size() + 1)
+            LOG_INFO("P25: no control channel heard on any of the %zu listed; still looking",
+                     follower_.control_channels().size());
+        break;
+    default:
         LOG_INFO("P25: back to the control channel at %.5f MHz", action.frequency / 1e6);
+        break;
+    }
 }
 
 // Selects the channel to listen to and turns the audio on.  With `search_hz`
@@ -1666,6 +1828,12 @@ void App::follow_to(const FollowAction& action)
 void App::listen_to(double hz, double search_hz)
 {
     stop_scanning();
+    select_channel(hz, search_hz);
+}
+
+// The same, but scanning (of the control channels) goes on: the follower's.
+void App::select_channel(double hz, double search_hz)
+{
     listen_.selected  = true;
     listen_.frequency = hz;
     listen_mhz_       = hz / 1e6;
@@ -1818,12 +1986,34 @@ void App::update_listening()
             scanner_->set_threshold(listen_.scan_threshold);
         }
     }
-    // Following a P25 system's calls (not while scanning: the scanner chooses the channels then).
+    // What was said, as it is transcribed: for the window, and the log.
+    if (transcriber_) {
+        for (Transcript& t : transcriber_->since(transcript_serial_)) {
+            transcript_serial_ = t.serial;
+            LOG_INFO("Transcript: %s", format_transcript(t).c_str());
+            transcripts_.push_back(std::move(t));
+        }
+        if (transcripts_.size() > Transcriber::kKept)
+            transcripts_.erase(transcripts_.begin(), transcripts_.end() - static_cast<ptrdiff_t>(Transcriber::kKept));
+    }
+    // Following a P25 system's calls (not while scanning for signals: the
+    // scanner chooses the channels then).
     if (listen_.on && !scanning() && follower_.enabled()) {
-        const FollowAction action =
+        const TrunkFollower::State before = follower_.state();
+        const FollowAction         action =
             follower_.update(settled ? listen_status_.frequency : std::numeric_limits<double>::quiet_NaN(),
-                             listen_status_.p25, listen_status_.p25p2,
-                             std::chrono::duration<double>(Clock::now().time_since_epoch()).count());
+                             listen_status_.p25, listen_status_.p25p2, follow_clock());
+        const TrunkFollower::State after = follower_.state();
+        if (before == TrunkFollower::State::Hunting && after == TrunkFollower::State::Control) {
+            hunt_tries_ = 0;
+            LOG_INFO("P25: control channel at %.5f MHz (%d of %zu listed): following its calls",
+                     follower_.control_frequency() / 1e6, follower_.listed_index() + 1,
+                     follower_.control_channels().size());
+        } else if (before == TrunkFollower::State::Control && after == TrunkFollower::State::Hunting) {
+            hunt_tries_ = 0;
+            LOG_INFO("P25: the control channel at %.5f MHz has gone quiet: looking for one",
+                     follower_.control_frequency() / 1e6);
+        }
         if (action.tune)
             follow_to(action);
     }
@@ -2247,12 +2437,30 @@ void App::draw_listen_window()
         ImGui::PushItemWidth(-80.0f * scale);
 
         // ---- Scanning ----
-        bool scan = scanning();
-        if (ImGui::Checkbox("Scan for signals (S)", &scan)) {
+        // (The "###" part keeps the check box the same while its label changes.)
+        bool scan = scanning() || channel_scanning();
+        if (ImGui::Checkbox(channel_scan_wanted() ? "Scan control channels (S)###scan" : "Scan for signals (S)###scan",
+                            &scan)) {
             if (scan)
                 start_scanning();
             else
                 stop_scanning();
+        }
+        if (channel_scan_wanted() && ImGui::IsItemHovered()) {
+            std::string listed;
+            for (const double hz : follower_.control_channels()) {
+                char line[32];
+                std::snprintf(line, sizeof(line), "\n  %.5f MHz", hz / 1e6);
+                listed += line;
+            }
+            ImGui::SetTooltip("P25 only, with control channels from --control-channels: try each in turn until\n"
+                              "one is heard to be a control channel, follow its calls, and when it goes quiet\n"
+                              "look again, from the next.  In this order:%s",
+                              listed.c_str());
+        }
+        if (channel_scanning()) {
+            draw_channel_scan();
+            ImGui::Separator();
         }
         if (scanning()) {
             const Scanner::Status st = scanner_->status();
@@ -2366,6 +2574,16 @@ void App::draw_listen_window()
             listener.set_volume(listen_.volume);
         }
 
+        int boost = static_cast<int>(std::lround(listen_.boost_db));
+        if (ImGui::SliderInt("Boost", &boost, 0, static_cast<int>(Listener::kMaxBoostDb), boost == 0 ? "off" : "+%d dB",
+                             ImGuiSliderFlags_AlwaysClamp)) {
+            listen_.boost_db = static_cast<float>(boost);
+            listener.set_boost(listen_.boost_db);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Amplify the audio beyond full volume, analog or digital, for quiet voice.\n"
+                              "What would then go past full scale is turned down rather than clipped.");
+
         float squelch = std::max(listen_.squelch, kSquelchSliderOff);
         if (ImGui::SliderFloat("Squelch", &squelch, kSquelchSliderOff, 0.0f,
                                squelch <= kSquelchSliderOff ? "off" : "%.0f dBFS", ImGuiSliderFlags_AlwaysClamp)) {
@@ -2392,11 +2610,18 @@ void App::draw_listen_window()
             listener.set_p25_only(listen_.p25_only);
             if (scanner_)
                 scanner_->set_p25_only(listen_.p25_only);
+            // With control channels listed, it also chooses what scanning goes through.
+            if ((scanning() && channel_scan_wanted()) || (channel_scanning() && !channel_scan_wanted())) {
+                stop_scanning();
+                start_scanning();
+            }
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Play only P25 voice, Phase 1 and 2: analog audio and other digital modes stay\n"
                               "silent.  Scanning, move on from anything that is not P25, and from a P25 channel\n"
-                              "without a call once the hold time is up.  With DMR only too, both.%s",
+                              "without a call once the hold time is up.  With DMR only too, both.\n"
+                              "With control channels from --control-channels, scanning goes through those\n"
+                              "instead, and follows the calls of the one heard.%s",
                               no_vocoder);
         bool follow = listen_.follow;
         if (ImGui::Checkbox("Follow calls", &follow))
@@ -2404,7 +2629,15 @@ void App::draw_listen_window()
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("On a P25 trunked system's control channel: go to the voice channel of each call\n"
                               "it grants - Phase 1, or Phase 2 and its slot - and back when the call ends.\n"
-                              "Calls that are encrypted are left out.  Not while scanning.");
+                              "Calls that are encrypted are left out.  Not while scanning for signals;\n"
+                              "scanning control channels turns it on.");
+        if (transcriber_) {
+            ImGui::SameLine();
+            ImGui::Checkbox("Transcript", &show_transcript_);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Show what is said in the DMR and P25 calls heard, as text\n"
+                                  "(speech to text with Whisper, on this computer)");
+        }
         draw_following();
         if ((listen_.dmr_only || listen_.p25_only) && scanning()) {
             float hold = static_cast<float>(listen_.dmr_hold);
@@ -2493,11 +2726,6 @@ void App::draw_listen_window()
 #endif
 }
 
-// A time series of the audio being played: the waveform on the short spans,
-// steadied on a rising zero crossing so that a tone stands still, and the
-// envelope - the lowest and highest value per pixel - on the long ones.  It
-// shows the audio before the volume control, so +/-1 is always full scale,
-// and it freezes while the display is paused.
 // The channels DMR voice has been heard on; a click goes back to one.
 void App::draw_heard_channels()
 {
@@ -2569,6 +2797,121 @@ void App::draw_heard_channels()
         heard_.clear();
     if (!std::isnan(chosen))
         listen_to_heard(chosen);
+}
+
+// What was said in the calls heard, as Whisper made it out: the latest at the top.
+void App::draw_transcript_window()
+{
+#if SPECTRO_HAVE_AUDIO
+    if (!transcriber_ || !listen_.on || !show_transcript_)
+        return;
+    const ImGuiIO& io     = ImGui::GetIO();
+    const float    scale  = imgui_->ui_scale();
+    const float    margin = 12.0f * scale;
+    const ImVec4   amber(1.0f, 0.75f, 0.3f, 1.0f), green(0.45f, 0.85f, 0.55f, 1.0f);
+
+    // Bottom right, beside the listening window.
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 2.0f * margin - 300.0f * scale, io.DisplaySize.y - 3.0f * margin),
+                            ImGuiCond_FirstUseEver, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowSize(ImVec2(500.0f * scale, 240.0f * scale), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Transcript", &show_transcript_, ImGuiWindowFlags_NoCollapse)) {
+        const TranscriberStatus st = transcriber_->status();
+        bool                    on = st.enabled;
+        if (ImGui::Checkbox("Transcribe", &on))
+            transcriber_->set_enabled(on);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Speech to text of the DMR and P25 voice heard, an over at a time once it ends:\n"
+                              "%s, on this computer.  Off: what is said is let go.",
+                              st.model.c_str());
+        ImGui::SameLine();
+        switch (st.state) {
+        case TranscriberStatus::State::Loading:
+            ImGui::TextDisabled("loading %s...", st.model.c_str());
+            break;
+        case TranscriberStatus::State::Failed:
+            ImGui::PushStyleColor(ImGuiCol_Text, amber);
+            ImGui::TextWrapped("%s", st.error.c_str());
+            ImGui::PopStyleColor();
+            break;
+        case TranscriberStatus::State::Ready:
+            if (!listen_status_.vocoder)
+                ImGui::TextColored(amber, "no vocoder in this build: no voice to hear");
+            else if (st.busy || st.waiting > 0)
+                ImGui::TextColored(green, "transcribing%s", st.waiting > 0 ? (" (" + std::to_string(st.waiting) + " waiting)").c_str() : "");
+            else
+                ImGui::TextDisabled("%s", st.model.c_str());
+            if (st.speed > 0.0 && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%.1f times as fast as the speech, lately", st.speed);
+            break;
+        }
+        if (st.dropped > 0) {
+            ImGui::SameLine();
+            ImGui::TextColored(amber, "%llu let go", static_cast<unsigned long long>(st.dropped));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Overs that came faster than they could be transcribed");
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(transcripts_.empty());
+        if (ImGui::SmallButton("Copy")) {
+            std::string all;
+            for (const Transcript& t : transcripts_)
+                all += format_transcript(t) + "\n";
+            ImGui::SetClipboardText(all.c_str());
+            toast("Transcript copied");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear##transcript"))
+            transcripts_.clear();
+        ImGui::EndDisabled();
+
+        if (transcripts_.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("Nothing yet.  What is said in the DMR and P25 calls heard appears here, "
+                               "each over once it ends.");
+            ImGui::PopStyleColor();
+        } else if (ImGui::BeginTable("transcripts", 3,
+                                     ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+                                         ImGuiTableFlags_BordersInnerV,
+                                     ImVec2(0.0f, ImGui::GetContentRegionAvail().y))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Time");
+            ImGui::TableSetupColumn("Who");
+            ImGui::TableSetupColumn("Said", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (size_t i = transcripts_.size(); i-- > 0;) {
+                const Transcript& t = transcripts_[i];
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                const auto when = static_cast<std::time_t>(std::floor(t.start));
+                std::tm    local{};
+                localtime_r(&when, &local);
+                char clock[16];
+                std::strftime(clock, sizeof(clock), "%H:%M:%S", &local);
+                ImGui::TextUnformatted(clock);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%.5f MHz, %s\n%.1f s of speech%s", t.frequency / 1e6,
+                                      transcript_channel(t).c_str(), t.seconds,
+                                      t.part > 0 ? " (a long over, continued)" : "");
+                ImGui::TableNextColumn();
+                const std::string who = transcript_speaker(t);
+                ImGui::TextUnformatted(who.empty() ? "?" : who.c_str());
+                ImGui::TableNextColumn();
+                const bool unsure = t.confidence < kUnsureTranscript;
+                if (unsure)
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                ImGui::TextWrapped("%s", t.text.c_str());
+                if (unsure) {
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Whisper was not sure of this (%.0f %%)",
+                                          100.0 * static_cast<double>(t.confidence));
+                }
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+#endif
 }
 
 // "DMR", "P25" or "DMR or P25": what DMR only and P25 only let through.
@@ -2736,11 +3079,29 @@ void App::draw_p25_phase2_status()
     }
 }
 
+// Scanning the control channels: the one being tried, or the one heard.
+void App::draw_channel_scan()
+{
+    const ImVec4 green(0.45f, 0.85f, 0.55f, 1.0f), amber(1.0f, 0.75f, 0.3f, 1.0f);
+    const size_t count = follower_.control_channels().size();
+    const int    index = follower_.listed_index();
+    if (follower_.state() == TrunkFollower::State::Hunting)
+        ImGui::TextColored(amber, "Trying %.5f MHz (%d of %zu)", follower_.trying_frequency() / 1e6, index + 1, count);
+    else if (index >= 0)
+        ImGui::TextColored(green, "Control channel %d of %zu heard", index + 1, count);
+    else
+        ImGui::TextColored(green, "On a control channel");
+    if (ImGui::Button("Skip (N)"))
+        skip_signal();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Try the next control channel of the list");
+}
+
 // Following a P25 system's calls: where the follower is.
 void App::draw_following()
 {
-    if (!listen_.follow)
-        return;
+    if (!listen_.follow || follower_.state() == TrunkFollower::State::Hunting)
+        return;  // (looking for a control channel: the scan says where)
     if (scanning()) {
         ImGui::TextDisabled("Following calls: paused while scanning");
         return;
@@ -2786,6 +3147,12 @@ void App::draw_dmr_status()
     }
 }
 
+// A time series of the audio being played: the waveform on the short spans,
+// steadied on a rising zero crossing so that a tone stands still, and the
+// envelope - the lowest and highest value per pixel - on the long ones.  It
+// shows the audio as played, after the volume control and any boost, so +/-1
+// is the sound card's full scale (which the limiter keeps it within), and it
+// freezes while the display is paused.
 void App::draw_audio_plot()
 {
     const AudioScope& scope = pipeline_.listener().scope();
@@ -2803,7 +3170,7 @@ void App::draw_audio_plot()
     const ImVec2 p1(p0.x + width, p0.y + height);
     ImGui::InvisibleButton("##audio plot", ImVec2(width, height));
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("The audio as played, before the volume control.\n+/-1 is full-scale deviation.");
+        ImGui::SetTooltip("The audio as played, after the volume control and any boost.\n+/-1 is full scale.");
 
     // Read what the plot needs: per pixel column, the lowest and highest value.
     const int columns = std::max(1, static_cast<int>(width));
@@ -2963,7 +3330,7 @@ void App::draw_help()
             {"Ctrl + click or drag", "Listen to the signal under the cursor (FM)"},
             {"L", "Audio on / off (scans for signals)"},
             {"S", "Scanning on / off"},
-            {"N", "Skip to the next signal while scanning"},
+            {"N", "Skip to the next signal (or control channel) while scanning"},
             {"1 / 2 / 3", "3D view / top view (2D waterfall) / front view (spectrum)"},
             {"Left / Right", "Tune down / up (Shift: fine, Ctrl: half the span)"},
             {"Up / Down", "Gain up / down (Shift: 5 dB steps)"},
@@ -3169,6 +3536,7 @@ void App::frame()
     if (view_.show_panel) {
         draw_panel();  // sets panel_fraction_ while docked at the left edge
         draw_listen_window();
+        draw_transcript_window();
     }
     lens_shift_ += (panel_fraction_ - lens_shift_) * (1.0f - std::exp(-dt * 10.0f));
     if (camera_untouched_ && (std::fabs(plot_aspect() - framed_aspect_) > 1e-3f ||

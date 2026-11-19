@@ -8,6 +8,7 @@
 #include <limits>
 #include <vector>
 
+#include "audio/limiter.hpp"
 #include "audio/rate_control.hpp"
 #include "audio/voice_playout.hpp"
 #include "dsp/ambe_vocoder.hpp"
@@ -205,6 +206,12 @@ void Listener::set_volume(float volume)
     change([&](Params& p) { p.volume = std::clamp(volume, 0.0f, 1.0f); });
 }
 
+void Listener::set_boost(float db)
+{
+    const float factor = std::pow(10.0f, std::clamp(db, 0.0f, kMaxBoostDb) / 20.0f);
+    change([&](Params& p) { p.boost = factor; });
+}
+
 ListenStatus Listener::status() const
 {
     ListenStatus s;
@@ -271,6 +278,7 @@ void Listener::run()
     SignalKind         published_kind    = SignalKind::Analysing;
     int                published_dmr     = 0;  // what decoded: 0 nothing, 1 DMR, 2 P25, 3 P25 Phase 2
     AudioRateControl   pacing(kAudioRate);
+    PeakLimiter        limiter(kAudioRate);
     std::vector<float> audio;
     audio.reserve(16384);
     double             trim = 0.0;  // the rate correction in force for this block
@@ -289,11 +297,14 @@ void Listener::run()
     std::vector<p25p2::System>  systems;  // announced by the control channels heard, latest last
     float                 speech[AmbeDecoder::kFrameSamples];
     float                 speech_power = 0.0f;  // of what is played in place of the FM audio
+    VoiceOvers            overs;                // the speech, an over at a time, for the voice sink
+    double                signal_time = 0.0;    // seconds of signal taken from the ring
     const auto            forget_dmr = [&] {
         dmr.reset();
         p25.reset();
         p25p2.reset();
         playout.reset();
+        overs.flush();
     };
 
     Params   p;
@@ -326,6 +337,7 @@ void Listener::run()
                 classifier.reset();
                 forget_dmr();
                 fifo_.discard();
+                limiter.reset();
                 trim      = 0.0;
                 gain      = 0.0f;
                 searching = false;
@@ -344,11 +356,14 @@ void Listener::run()
             p = next;
         }
 
+        overs.set_sink(voice_sink_.load(std::memory_order_acquire));
+
         // 2. Demodulate what has arrived.  The channel is given as an absolute
         //    frequency, so retuning the radio moves it within the stream - or
         //    out of it, and then there is nothing to hear.
         const size_t           n     = std::min(ring_.readable(), kMaxBlock);
         const IqRing::ReadSpans spans = ring_.peek(n);
+        signal_time += static_cast<double>(n) / sample_rate_;
 
         const double bandwidth = usable_bandwidth(p.bandwidth);
         const FmMode mode      = FmDemodulator::mode_for(bandwidth);
@@ -411,6 +426,24 @@ void Listener::run()
         const bool hear_dmr   = dmr_here && (!filtered || p.dmr_only);
         const bool hear_p25   = p25_here && (!filtered || p.p25_only);
         const bool hear_p25p2 = p25p2_here && (!filtered || p.p25_only);
+        if (overs.sink()) {
+            // Who speaks, for the overs.  (All ones is no one known.)
+            overs.set_channel(p.frequency);
+            const auto identify = [&](VoiceOvers::Stream stream, const auto& call, std::string destination) {
+                if (call.active && call.ids_known)
+                    overs.identify(stream, destination, call.source == 0xFFFFFF ? 0 : call.source);
+            };
+            if (hear_dmr) {
+                identify(VoiceOvers::DmrSlot1, dmr.status().slot[0], dmr_destination(dmr.status().slot[0]));
+                identify(VoiceOvers::DmrSlot2, dmr.status().slot[1], dmr_destination(dmr.status().slot[1]));
+            }
+            if (hear_p25)
+                identify(VoiceOvers::P25Phase1, p25.status().call, p25_destination(p25.status().call));
+            if (hear_p25p2) {
+                identify(VoiceOvers::P25Phase2Slot1, p25p2.status().slot[0], p25_destination(p25p2.status().slot[0]));
+                identify(VoiceOvers::P25Phase2Slot2, p25p2.status().slot[1], p25_destination(p25p2.status().slot[1]));
+            }
+        }
         for (const DmrVoice& v : dmr_voice) {
             if (!hear_dmr)
                 break;
@@ -418,6 +451,8 @@ void Listener::run()
                 ambe.reset();
             ambe.decode(v.frame, speech);
             playout.push(speech, AmbeDecoder::kFrameSamples);
+            overs.push(v.slot == 0 ? VoiceOvers::DmrSlot1 : VoiceOvers::DmrSlot2, speech, AmbeDecoder::kFrameSamples,
+                       v.first);
         }
         for (const P25Voice& v : p25_voice) {
             if (!hear_p25)
@@ -426,6 +461,7 @@ void Listener::run()
                 imbe.reset();
             imbe.decode(v.frame, speech);
             playout.push(speech, ImbeDecoder::kFrameSamples);
+            overs.push(VoiceOvers::P25Phase1, speech, ImbeDecoder::kFrameSamples, v.first);
         }
         for (const P25Phase2Voice& v : p25p2_voice) {
             if (!hear_p25p2)
@@ -434,10 +470,13 @@ void Listener::run()
                 ambe_p25p2.reset();
             ambe_p25p2.decode(v.frame, speech);
             playout.push(speech, AmbeDecoder::kFrameSamples);
+            overs.push(v.slot == 0 ? VoiceOvers::P25Phase2Slot1 : VoiceOvers::P25Phase2Slot2, speech,
+                       AmbeDecoder::kFrameSamples, v.first);
         }
         dmr_voice.clear();
         p25_voice.clear();
         p25p2_voice.clear();
+        overs.advance(signal_time);
         const bool heard = hear_dmr || hear_p25 || hear_p25p2;
         if (heard && !audio.empty()) {
             playout.pull(audio.data(), audio.size(), kAudioRate * (1.0 + trim));
@@ -503,14 +542,16 @@ void Listener::run()
             }
         }
 
-        // 4. Volume, then into the FIFO at a rate that keeps its fill level steady.
+        // 4. Volume (with any boost beyond it; past full scale, the limiter
+        //    takes over), then - as played, for the plot too - into the FIFO
+        //    at a rate that keeps its fill level steady.
         if (!audio.empty()) {
-            scope_.write(audio.data(), audio.size(), p.muted);
-            const float target_gain = p.muted ? 0.0f : p.volume * p.volume;
+            const float target_gain = p.muted ? 0.0f : p.volume * p.volume * p.boost;
             for (float& v : audio) {
                 gain += kGainSmoothing * (target_gain - gain);
-                v = std::clamp(v * gain, -1.0f, 1.0f);
+                v = limiter.process(v * gain);
             }
+            scope_.write(audio.data(), audio.size(), p.muted);
 
             const bool                       playing = fifo_.playing();
             const AudioRateControl::Decision pace    = pacing.update(
@@ -546,6 +587,7 @@ void Listener::run()
             load_cpu  = cpu;
         }
     }
+    overs.flush();  // what was being said when listening stopped
 }
 
 }  // namespace spectro
