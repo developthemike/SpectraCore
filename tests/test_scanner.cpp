@@ -1,11 +1,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <thread>
 #include <vector>
 
 #include "app/pipeline.hpp"
+#include "audio/listener.hpp"
 #include "audio/scanner.hpp"
 #include "radio/sim_source.hpp"
 #include "test_framework.hpp"
@@ -62,6 +64,7 @@ public:
     };
     std::vector<Tune> tunes;
     bool              muted = false;
+    ScanContent       content;  // what it reports the channel carries
 
     void   scan_tune(double frequency_hz, double bandwidth_hz, double search_hz) override
     {
@@ -72,6 +75,7 @@ public:
     {
         return tunes.empty() ? std::numeric_limits<double>::quiet_NaN() : tunes.back().frequency;
     }
+    ScanContent scan_content() const override { return content; }
 };
 
 // Feeds `seconds` of identical rows, 50 per second.
@@ -182,16 +186,39 @@ TEST(scanner_follows_transmissions)
     CHECK_EQ(rx.tunes.size(), size_t{3});
     CHECK_NEAR(rx.tunes.back().frequency, view.frequency(500), 0.5 * view.column_hz());
 
-    // Skipping leaves a signal out from then on.
-    scanner.skip();
+    // Skipping moves on at once, and leaves the signal out while the rest of
+    // the list is gone through: here, the steady one at the bottom.
+    feed(scanner, ab, 0.3);
+    CHECK(!scanner.skip());
     CHECK_EQ(scanner.lockouts(), size_t{1});
+    feed(scanner, ab, 0.3);
+    CHECK_EQ(rx.tunes.size(), size_t{4});
+    CHECK_NEAR(rx.tunes.back().frequency, view.frequency(1500), 0.5 * view.column_hz());
+    // When the other one ends, the skipped one is not taken up again ...
     feed(scanner, a, 1.0);
     CHECK(scanner.status().state == Scanner::State::Searching);
-    CHECK_EQ(rx.tunes.size(), size_t{3});
-    CHECK(scanner.candidates().empty());
-    scanner.clear_lockouts();
-    feed(scanner, a, 0.5);
     CHECK_EQ(rx.tunes.size(), size_t{4});
+    CHECK(scanner.candidates().empty());
+    // ... but skipping the last of the list goes round again from the first.
+    feed(scanner, ab, 0.3);
+    CHECK_EQ(rx.tunes.size(), size_t{5});
+    CHECK(scanner.skip());
+    CHECK_EQ(scanner.lockouts(), size_t{0});
+    feed(scanner, ab, 0.3);
+    CHECK_EQ(rx.tunes.size(), size_t{6});
+    CHECK_NEAR(rx.tunes.back().frequency, view.frequency(500), 0.5 * view.column_hz());
+    // A list of one: skipping comes straight back to it.
+    feed(scanner, a, 0.3);
+    CHECK(scanner.skip());
+    feed(scanner, a, 0.3);
+    CHECK_EQ(rx.tunes.size(), size_t{7});
+    CHECK_NEAR(rx.tunes.back().frequency, view.frequency(500), 0.5 * view.column_hz());
+    // Clearing brings the skipped signals back at once.
+    feed(scanner, ab, 0.3);
+    scanner.skip();
+    CHECK_EQ(scanner.lockouts(), size_t{1});
+    scanner.clear_lockouts();
+    CHECK_EQ(scanner.lockouts(), size_t{0});
 
     // Retuning the radio (a gap row) starts the search afresh.
     RowInfo gap;
@@ -200,7 +227,7 @@ TEST(scanner_follows_transmissions)
     CHECK(scanner.status().state == Scanner::State::Searching);
     CHECK(rx.muted);
     feed(scanner, a, 0.5);
-    CHECK_EQ(rx.tunes.size(), size_t{5});
+    CHECK_EQ(rx.tunes.size(), size_t{8});
 
     // Wideband signals get a wideband channel.
     Scanner wide_scanner(rx);
@@ -298,9 +325,238 @@ TEST(scanner_tours_the_simulator)
         CHECK_NEAR(listener.status().audio_rms, loudness, 0.08);
     }
 
+    // Skipping on past the top of the list goes round to the first again.
+    bool wrapped = false;
+    for (int hop = 0; hop < 12 && reached && !wrapped; ++hop) {
+        const bool round = scanner.skip();
+        if (!wait_for_signal())
+            break;
+        if (round) {
+            wrapped = true;
+            CHECK_NEAR(listener.status().frequency, carrier_hz, 1000.0);
+            CHECK_EQ(scanner.lockouts(), size_t{0});
+        }
+    }
+    CHECK(wrapped);
+
     scanner.stop();
     listener.set_enabled(false);
     const AcquisitionStats stats = pipeline.acquisition().stats();
     CHECK_EQ(stats.lost_samples, uint64_t{0});
+    pipeline.stop();
+}
+
+TEST(scanner_waits_only_for_dmr_voice)
+{
+    const SpectrumView view = test_view();
+    FakeReceiver       rx;
+    Scanner            scanner(rx);
+    scanner.set_threshold(-60.0f);
+    scanner.set_dmr_only(true);
+    scanner.set_dmr_hold(2.0);
+    const Row rows = Row().narrow(500, -40.0f).narrow(1500, -45.0f).flat(1700, 150, -55.0f);
+
+    // Not DMR: it moves on after about a second, and the broadcast-wide
+    // signal is not even a candidate.
+    scanner.start();
+    feed(scanner, rows, 0.3);
+    CHECK_EQ(rx.tunes.size(), size_t{1});
+    CHECK_NEAR(rx.tunes.back().frequency, view.frequency(500), 0.5 * view.column_hz());
+    CHECK_EQ(scanner.candidates().size(), size_t{2});
+    CHECK(!scanner.status().dmr);
+    CHECK(scanner.status().wait_left > 0.0 && scanner.status().wait_left <= Scanner::kRecogniseSeconds);
+    feed(scanner, rows, 1.2);
+    CHECK_EQ(rx.tunes.size(), size_t{2});
+    CHECK_NEAR(rx.tunes.back().frequency, view.frequency(1500), 0.5 * view.column_hz());
+
+    // DMR without a call: it waits for the hold time.
+    rx.content.dmr = true;
+    feed(scanner, rows, 1.0);
+    CHECK_EQ(rx.tunes.size(), size_t{2});
+    CHECK(scanner.status().dmr && !scanner.status().voice);
+    CHECK(scanner.status().wait_left > 0.0);
+    feed(scanner, rows, 1.5);
+    CHECK_EQ(rx.tunes.size(), size_t{3});
+    CHECK_NEAR(rx.tunes.back().frequency, view.frequency(500), 0.5 * view.column_hz());
+
+    // A call: it stays as long as it lasts ...
+    rx.content.dmr_voice = true;
+    feed(scanner, rows, 6.0);
+    CHECK_EQ(rx.tunes.size(), size_t{3});
+    CHECK(scanner.status().voice);
+    CHECK(!rx.muted);
+    // ... and waits the hold time for the next over before moving on.
+    rx.content.dmr_voice = false;
+    feed(scanner, rows, 1.5);
+    CHECK_EQ(rx.tunes.size(), size_t{3});
+    rx.content.dmr_voice = true;  // the next over
+    feed(scanner, rows, 1.0);
+    rx.content.dmr_voice = false;
+    feed(scanner, rows, 1.5);
+    CHECK_EQ(rx.tunes.size(), size_t{3});
+    feed(scanner, rows, 1.0);
+    CHECK_EQ(rx.tunes.size(), size_t{4});
+    CHECK_NEAR(rx.tunes.back().frequency, view.frequency(1500), 0.5 * view.column_hz());
+
+    // Without DMR only it stays put, whatever the channel carries.
+    scanner.set_dmr_only(false);
+    rx.content = {};
+    feed(scanner, rows, 3.0);
+    CHECK_EQ(rx.tunes.size(), size_t{4});
+}
+
+TEST(scanner_stays_for_a_whole_dmr_call)
+{
+    // A call holds the scanner until it ends: past the hold time, and through
+    // a fade below the threshold far longer than the hang time - with DMR
+    // only or without.
+    const SpectrumView view = test_view();
+    const Row          both = Row().narrow(500, -40.0f).narrow(1500, -45.0f);
+    const Row          fade = Row().narrow(500, -70.0f).narrow(1500, -45.0f);  // the call's signal below the threshold
+    for (const bool dmr_only : {true, false}) {
+        FakeReceiver rx;
+        Scanner      scanner(rx);
+        scanner.set_threshold(-60.0f);
+        scanner.set_hang(0.5);
+        scanner.set_dmr_only(dmr_only);
+        scanner.set_dmr_hold(2.0);
+        rx.content = {true, true};  // DMR, a call on
+
+        scanner.start();
+        feed(scanner, both, 0.3);
+        CHECK_EQ(rx.tunes.size(), size_t{1});
+        feed(scanner, both, 4.0);  // longer than the hold time
+        feed(scanner, fade, 3.0);  // and a fade far longer than the hang time
+        CHECK_EQ(rx.tunes.size(), size_t{1});
+        CHECK(scanner.status().state == Scanner::State::Receiving);
+        CHECK(scanner.status().voice);
+        CHECK(!rx.muted);
+
+        // The call ends: the usual rules again, here the hang time of a signal gone.
+        rx.content.dmr_voice = false;
+        feed(scanner, fade, 1.0);
+        CHECK_EQ(rx.tunes.size(), size_t{2});
+        CHECK_NEAR(rx.tunes.back().frequency, view.frequency(1500), 0.5 * view.column_hz());
+    }
+}
+
+TEST(scanner_waits_for_the_systems_asked_for)
+{
+    // P25 only: DMR is passed by like anything else; P25 is waited on, and a
+    // P25 call holds the scan.  With both, either.
+    const Row          rows = Row().narrow(500, -40.0f).narrow(1500, -45.0f);
+    FakeReceiver       rx;
+    Scanner            scanner(rx);
+    scanner.set_threshold(-60.0f);
+    scanner.set_p25_only(true);
+    scanner.set_dmr_hold(2.0);
+    rx.content = {true, true, false, false};  // a DMR call: not asked for
+    scanner.start();
+    feed(scanner, rows, 0.3);
+    CHECK_EQ(rx.tunes.size(), size_t{1});
+    CHECK(!scanner.status().voice && !scanner.status().wanted);
+    feed(scanner, rows, 1.2);
+    CHECK_EQ(rx.tunes.size(), size_t{2});  // moved on after about a second
+
+    rx.content = {false, false, true, false};  // P25, no call: the hold time
+    feed(scanner, rows, 1.5);
+    CHECK_EQ(rx.tunes.size(), size_t{2});
+    CHECK(scanner.status().p25 && scanner.status().wanted);
+    rx.content.p25_voice = true;  // a call
+    feed(scanner, rows, 5.0);
+    CHECK_EQ(rx.tunes.size(), size_t{2});
+    CHECK(scanner.status().voice);
+    rx.content.p25_voice = false;
+    feed(scanner, rows, 2.5);
+    CHECK_EQ(rx.tunes.size(), size_t{3});
+
+    // Both asked for: the DMR call holds it too.
+    scanner.set_dmr_only(true);
+    rx.content = {true, true, false, false};
+    feed(scanner, rows, 4.0);
+    CHECK_EQ(rx.tunes.size(), size_t{3});
+    CHECK(scanner.status().voice);
+}
+
+TEST(scanner_finds_dmr_calls_in_the_simulator)
+{
+    // Scanning the simulator with DMR only: the carriers, the analog voice
+    // channel and the pager are passed by within seconds; the DMR repeater is
+    // kept while its first call lasts (a second to about 4.7 s in), then left
+    // once the hold time is up.
+    Options options;
+    options.source.kind        = "sim";
+    options.source.sample_rate = 2.4e6;
+    options.source.frequency   = 98e6;
+    options.source.gain        = SimSource::kReferenceGainDb;
+    Pipeline pipeline(options);
+    pipeline.start();
+    Listener& listener = pipeline.listener();
+    listener.set_volume(0.0f);
+    listener.set_dmr_only(true);
+    listener.set_enabled(true);
+
+    constexpr double kHold = 1.5;
+    Scanner          scanner(listener);
+    scanner.set_threshold(-55.0f);
+    scanner.set_dmr_only(true);
+    scanner.set_dmr_hold(kHold);
+    scanner.start();
+
+    struct Visit {
+        double frequency, seconds;
+        bool   voice;
+    };
+    std::vector<Visit> visits;
+    const double       dmr_hz  = 98e6 + SimSource::digital_stations(2.4e6)[0].offset_hz;
+    const int          columns = pipeline.columns();
+    std::vector<float> row(static_cast<size_t>(columns));
+    const auto         start = std::chrono::steady_clock::now();
+    auto               since = start;
+    double             at    = std::numeric_limits<double>::quiet_NaN();
+    bool               voice = false;
+    const auto         now_s = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); };
+    while (now_s() < 8.0) {
+        RowInfo info;
+        if (pipeline.engine().pop_rows(row.data(), 1, &info) != 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        scanner.on_row(row.data(), info, {98e6, 2.4e6, columns, info.fft_size});
+        const Scanner::Status st     = scanner.status();
+        const bool            locked = st.state == Scanner::State::Receiving || st.state == Scanner::State::Holding;
+        const double          here   = locked ? st.frequency : std::numeric_limits<double>::quiet_NaN();
+        const bool            same   = std::isnan(here) ? std::isnan(at) : !std::isnan(at) && std::fabs(here - at) < 5e3;
+        if (!same) {
+            const auto t = std::chrono::steady_clock::now();
+            if (!std::isnan(at))
+                visits.push_back({at, std::chrono::duration<double>(t - since).count(), voice});
+            at    = here;
+            since = t;
+            voice = false;
+        }
+        voice |= locked && st.voice;
+    }
+    if (!std::isnan(at))
+        visits.push_back({at, std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count(), voice});
+
+    bool kept = false, left_after = false;
+    for (size_t i = 0; i < visits.size(); ++i) {
+        const Visit& v      = visits[i];
+        const bool   is_dmr = std::fabs(v.frequency - dmr_hz) < 5e3;
+        std::printf("    %.4f MHz for %.1f s%s%s\n", v.frequency / 1e6, v.seconds, is_dmr ? " (DMR)" : "",
+                    v.voice ? ", a call" : "");
+        if (is_dmr && v.voice && v.seconds > 2.0) {
+            kept       = true;
+            left_after = i + 1 < visits.size();
+        }
+        if (!is_dmr && i + 1 < visits.size())
+            CHECK(v.seconds < 2.0);  // not DMR: passed by
+    }
+    CHECK(kept);
+    CHECK(left_after);
+
+    scanner.stop();
+    listener.set_enabled(false);
     pipeline.stop();
 }

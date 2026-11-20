@@ -99,9 +99,18 @@ public:
     // Forgets the signal seen so far.  Use after a break in the stream.
     void reset();
 
+    // What the demodulator sees, for telling kinds of signal apart: the
+    // instantaneous frequency (Hz) of the channel and its power, at the audio
+    // rate (averaged and picked from the discriminator rate for wideband FM).
+    struct Analysis {
+        std::vector<float> frequency;
+        std::vector<float> power;
+    };
+
     // Demodulates `samples` IQ pairs (SC16 Q11) and appends the audio to `audio`:
-    // mono, at the audio rate, +/-1.0 at full-scale deviation (see above).
-    void process(const int16_t* iq, size_t samples, std::vector<float>& audio);
+    // mono, at the audio rate, +/-1.0 at full-scale deviation (see above).  With
+    // `analysis`, appends to that too.
+    void process(const int16_t* iq, size_t samples, std::vector<float>& audio, Analysis* analysis = nullptr);
 
     double sample_rate() const { return sample_rate_; }
     double audio_rate() const { return audio_rate_; }
@@ -181,6 +190,9 @@ private:
     float  audio_per_hz_  = 0.0f;
     double freq_sum_   = 0.0;
     size_t freq_count_ = 0;
+    Analysis* analysis_       = nullptr;  // during process()
+    double    analysis_sum_   = 0.0;
+    int       analysis_count_ = 0;
 
     // --- Stage 4: audio ---
     float  deemph_coeff_ = 1.0f, deemph_gain_ = 1.0f, deemph_state_ = 0.0f;

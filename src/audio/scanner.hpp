@@ -15,6 +15,16 @@
 //     comes back, as two-way radio conversations pause between overs.  Then it
 //     goes on to the next signal above it in frequency, wrapping around at the
 //     top of the band.
+//   - Skipping moves on at once, and leaves the signal out while the rest of
+//     the list is gone through; skipping the last one starts the list again
+//     from the bottom, with nothing left out.
+//   - A DMR or P25 call holds the scanner until it ends, whatever the
+//     signal's level does meanwhile.
+//   - DMR only, P25 only (or both): it stays only for voice of those systems.
+//     A signal that is not one of them is left after about a second; one
+//     without a call (an idle repeater, a control channel) after the hold
+//     time, which starts again when a call ends.  Wideband signals cannot be
+//     either and are passed by.
 //   - The audio is muted while there is nothing to hear: while searching and
 //     during the hang time.
 //
@@ -66,6 +76,14 @@ std::vector<DetectedSignal> find_signals(const float* power, const SpectrumView&
 // The channel width to listen to a signal with.
 double listen_bandwidth_for(const DetectedSignal& signal, double column_hz);
 
+// What the receiver makes of the channel it is on.
+struct ScanContent {
+    bool dmr       = false;  // DMR decodes
+    bool dmr_voice = false;  // a DMR call that can be heard (not encrypted) is in progress
+    bool p25       = false;  // P25 decodes
+    bool p25_voice = false;  // a P25 call that can be heard is in progress
+};
+
 // What a Scanner drives (the Listener, or a stand-in in tests).
 class ScanReceiver {
 public:
@@ -76,6 +94,7 @@ public:
     virtual void scan_mute(bool muted) = 0;
     // Where the receiver settled on the carrier; NaN while it is still looking.
     virtual double scan_frequency() const = 0;
+    virtual ScanContent scan_content() const = 0;
 };
 
 class Scanner {
@@ -92,6 +111,8 @@ public:
     static constexpr float  kHysteresisDb               = 3.0f;   // a signal ends this far below the threshold
     static constexpr double kSmoothingSeconds           = 0.1;    // of the spectrum
     static constexpr double kConfirmSeconds             = 0.06;   // a candidate must last this long
+    static constexpr double kDefaultDmrHold             = 5.0;    // seconds, DMR/P25 only: waiting for a call
+    static constexpr double kRecogniseSeconds           = 1.0;    // DMR/P25 only: time to recognise either
 
     explicit Scanner(ScanReceiver& receiver);
 
@@ -105,10 +126,21 @@ public:
     float threshold() const { return threshold_; }
     void   set_hang(double seconds);
     double hang() const { return hang_; }
+    // DMR only, P25 only: stay only for voice of these systems, and for at
+    // most `dmr_hold` seconds without a call.
+    void   set_dmr_only(bool dmr_only) { dmr_only_ = dmr_only; }
+    bool   dmr_only() const { return dmr_only_; }
+    void   set_p25_only(bool p25_only) { p25_only_ = p25_only; }
+    bool   p25_only() const { return p25_only_; }
+    bool   filtered() const { return dmr_only_ || p25_only_; }
+    void   set_dmr_hold(double seconds);
+    double dmr_hold() const { return dmr_hold_; }
 
-    // Moves on from the signal being received, and leaves it out from now on
-    // (until clear_lockouts()).
-    void   skip();
+    // Moves on from the signal being received, and leaves it out until the
+    // end of the list: when there is no other signal to go on to, everything
+    // skipped comes back and the scan starts again from the bottom.  Returns
+    // true then.
+    bool   skip();
     void   clear_lockouts() { lockouts_.clear(); }
     size_t lockouts() const { return lockouts_.size(); }
 
@@ -126,6 +158,12 @@ public:
         double hold_left    = 0.0;      // seconds of hang time left (Holding)
         float  floor_dbfs   = -200.0f;  // noise floor of the spectrum
         bool   warming_up   = false;    // too soon after a (re)start to tell
+        // While on a signal:
+        bool   dmr          = false;    // it is DMR
+        bool   p25          = false;    // it is P25
+        bool   voice        = false;    // with a call to hear: the scanner stays until it ends
+        bool   wanted       = false;    // DMR/P25 only: it is a system asked for
+        double wait_left    = 0.0;      // DMR/P25 only: seconds until moving on for want of a call
     };
     Status status() const { return status_; }
 
@@ -147,6 +185,10 @@ private:
     State         state_     = State::Off;
     float         threshold_ = -60.0f;
     double        hang_      = kDefaultHang;
+    bool          dmr_only_  = false;
+    bool          p25_only_  = false;
+    double        dmr_hold_  = kDefaultDmrHold;
+    double        quiet_     = 0.0;  // seconds on this signal without DMR voice
 
     // Smoothed spectrum, in dB per column like the display: a signal that stops
     // falls below the threshold just as fast whatever its strength.  And the

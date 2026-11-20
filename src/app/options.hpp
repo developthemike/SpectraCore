@@ -3,6 +3,7 @@
 
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "dsp/spectrum_engine.hpp"
 #include "radio/iq_source.hpp"
@@ -35,10 +36,23 @@ struct Options {
     double listen_bandwidth = 12.5e3;  // Hz; up to 25 kHz narrowband FM, from 100 kHz wideband FM
     double deemphasis_us    = 75.0;    // wideband FM: 75 (the Americas, South Korea) or 50 (elsewhere)
     double volume           = std::numeric_limits<double>::quiet_NaN();  // percent; NaN = default
+    double boost_db         = 0.0;     // amplify the audio beyond full volume
     double squelch          = std::numeric_limits<double>::quiet_NaN();  // dBFS; NaN = off
     bool   scan             = false;   // listen by scanning for signals
     double scan_threshold   = std::numeric_limits<double>::quiet_NaN();  // dBFS; NaN = from the noise floor
     double scan_hang        = 2.0;     // seconds
+    bool   dmr_only         = false;   // play only DMR voice; scanning, stay only for it
+    bool   p25_only         = false;   // likewise P25, Phase 1 and 2 (with both: both)
+    bool   follow_calls     = false;   // on a P25 control channel, follow the calls it grants
+    double dmr_hold         = 5.0;     // seconds a scan waits on a DMR channel for a call
+    // P25 control channels (Hz) from --control-channels: with P25 only,
+    // scanning tries them in turn and follows the calls of the one heard.
+    std::vector<double> control_channels;
+
+    // Speech to text of the voice decoded (DMR, P25)
+    std::string transcribe_model;               // a Whisper model, ggml .bin; empty = no speech to text
+    std::string transcribe_language = "en";     // "auto": found out each time
+    std::string transcript_file;                // also append the transcripts here
 
     // Diagnostics and automation
     bool        list_gpus        = false;

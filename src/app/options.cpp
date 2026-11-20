@@ -1,12 +1,16 @@
 #include "app/options.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
+#include <system_error>
 #include <string_view>
 #include <vector>
 
+#include "audio/control_channels.hpp"
 #include "audio/listener.hpp"
 #include "util/units.hpp"
 
@@ -240,6 +244,16 @@ std::vector<Flag> make_flags(Options& o, Given& given)
             }
             return true;
         });
+    add("--boost", "DB", "Amplify the audio beyond full volume, 0 to 20 dB (default 0); peaks are limited, not clipped",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_number(v, o.boost_db, e, "boost"))
+                return false;
+            if (!(o.boost_db >= 0.0 && o.boost_db <= Listener::kMaxBoostDb)) {
+                e = "the boost must be between 0 and 20 dB";
+                return false;
+            }
+            return true;
+        });
     add("--scan", nullptr, "Listen by scanning: play each signal above --scan-threshold while it lasts",
         [&o](const std::string&, std::string&) { o.scan = true; return true; });
     add("--scan-threshold", "DB", "Level in dBFS a signal's peak must reach (default: 15 dB above the noise)",
@@ -262,6 +276,25 @@ std::vector<Flag> make_flags(Options& o, Given& given)
             }
             return true;
         });
+    add("--dmr-only", nullptr, "Play only DMR voice; scanning, move on from anything else",
+        [&o](const std::string&, std::string&) { o.dmr_only = true; return true; });
+    add("--p25-only", nullptr, "Play only P25 voice (Phase 1 and 2); scanning, move on from anything else",
+        [&o](const std::string&, std::string&) { o.p25_only = true; return true; });
+    add("--follow-calls", nullptr, "On a P25 control channel, follow each call it grants to its voice channel and back",
+        [&o](const std::string&, std::string&) { o.follow_calls = true; return true; });
+    add("--control-channels", "FILE", "P25 control channels, a JSON list: with --p25-only, scanning tries each "
+                                      "until one is heard, follows its calls, and looks again when it is lost",
+        [&o](const std::string& v, std::string& e) { return read_control_channels(v, o.control_channels, e); });
+    add("--dmr-hold", "SEC", "DMR/P25 only, scanning: how long to wait on a channel for a call (default 5)",
+        [&o](const std::string& v, std::string& e) {
+            if (!parse_number(v, o.dmr_hold, e, "time"))
+                return false;
+            if (!(o.dmr_hold >= 0.5 && o.dmr_hold <= 600.0)) {
+                e = "the DMR hold time must be between 0.5 and 600 seconds";
+                return false;
+            }
+            return true;
+        });
     add("--squelch", "DB", "Mute the audio while the channel is below this level in dBFS (default: off)",
         [&o](const std::string& v, std::string& e) {
             if (!parse_number(v, o.squelch, e, "level"))
@@ -272,6 +305,29 @@ std::vector<Flag> make_flags(Options& o, Given& given)
             }
             return true;
         });
+    add("--transcribe", "MODEL", "Transcribe the DMR and P25 voice heard, with this Whisper model (ggml .bin file)",
+        [&o](const std::string& v, std::string& e) {
+            std::error_code error;
+            if (!std::filesystem::is_regular_file(v, error)) {
+                e = "no Whisper model at " + v + " (see the README for where to get one)";
+                return false;
+            }
+            o.transcribe_model = v;
+            return true;
+        });
+    add("--transcribe-language", "CODE", "Language of the speech: en (default), es, fr, ... or auto",
+        [&o](const std::string& v, std::string& e) {
+            const bool code = (v.size() == 2 || v.size() == 3) &&
+                              std::all_of(v.begin(), v.end(), [](char c) { return c >= 'a' && c <= 'z'; });
+            if (!code && v != "auto") {
+                e = "the language must be a code such as en or es, or auto";
+                return false;
+            }
+            o.transcribe_language = v;
+            return true;
+        });
+    add("--transcript-file", "PATH", "Also append each transcript to this file",
+        [&o](const std::string& v, std::string&) { o.transcript_file = v; return true; });
 
     // ---- Display ----
     add("--db-min", "DB", "Bottom of the level scale in dBFS (default: automatic)",

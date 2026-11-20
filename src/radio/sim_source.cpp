@@ -10,12 +10,18 @@
 
 #include <fftw3.h>
 
+#include "dsp/ambe_vocoder.hpp"
+#include "dsp/dmr_transmitter.hpp"
+#include "dsp/p25_phase2_transmitter.hpp"
+#include "dsp/p25_transmitter.hpp"
+#include "dsp/p25_trunking.hpp"
 #include "dsp/fftw_lock.hpp"
 
 namespace spectro {
 
 namespace {
 
+constexpr double kPi        = std::numbers::pi;
 constexpr double kTwoPi     = 2.0 * std::numbers::pi;
 constexpr double kFullScale = 2048.0;
 
@@ -54,6 +60,17 @@ constexpr double kBroadcastPreEmphasisS = 75e-6;
 constexpr double kBroadcastNoteSeconds  = 0.3;
 constexpr double kBroadcastNotesHz[]    = {220.0, 261.63, 329.63, 440.0, 329.63, 261.63};  // A3 C4 E4 A4 E4 C4
 constexpr double kBroadcastHalfWidthHz  = 100e3;
+
+// Digital stations, above the voice channel and clear of the rest.
+constexpr double kDmrCenter     = -0.24;
+constexpr double kDmrLevel      = -40.0;
+constexpr double kPagerCenter   = -0.15;
+constexpr double kPagerLevel    = -42.0;
+constexpr double kP25Center     = 0.14;
+constexpr double kP25Level      = -41.0;
+constexpr double kDigitalHalfWidthHz = 6.25e3;
+// DMR's base station data sync, one symbol per character ('1' = +3, '3' = -3).
+constexpr uint32_t    kPocsagSync = 0x7CD215D8;
 
 constexpr double kChirpLo      = -0.47;
 constexpr double kChirpHi      = 0.47;
@@ -145,6 +162,39 @@ double pre_emphasis(double hz)
     return response(hz) / response(1000.0);
 }
 
+// Something like speech, -1 ... 1, `count` samples from `first` at `rate`: a
+// voice whose pitch wanders between 100 and 190 Hz, two formants, and
+// syllables about four times a second.  The pitch is taken as steady over
+// one call (20 ms or so) to keep it cheap.
+void synthetic_speech(uint64_t first, size_t count, double rate, float* out)
+{
+    const auto pitch_at = [](double t) {
+        return 145.0 + 45.0 * std::sin(2.0 * kPi * 0.7 * t) + 10.0 * std::sin(2.0 * kPi * 3.1 * t);
+    };
+    const auto cycles_at = [](double t) {  // the integral of the pitch
+        return 145.0 * t - 45.0 / (2.0 * kPi * 0.7) * std::cos(2.0 * kPi * 0.7 * t) -
+               10.0 / (2.0 * kPi * 3.1) * std::cos(2.0 * kPi * 3.1 * t);
+    };
+    const double middle = (static_cast<double>(first) + 0.5 * static_cast<double>(count)) / rate;
+    const double pitch  = pitch_at(middle);
+    double       gain[25];
+    int          harmonics = 0;
+    for (; harmonics < 25 && (harmonics + 1) * pitch <= 3500.0; ++harmonics) {
+        const double f   = (harmonics + 1) * pitch;
+        gain[harmonics] = std::exp(-std::pow((f - 500.0) / 250.0, 2.0)) +
+                          0.6 * std::exp(-std::pow((f - 1500.0) / 400.0, 2.0)) + 0.05;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const double t      = static_cast<double>(first + i) / rate;
+        const double cycles = cycles_at(t);
+        double       v      = 0.0;
+        for (int h = 1; h <= harmonics; ++h)
+            v += gain[h - 1] * std::sin(2.0 * kPi * h * cycles + 0.3 * h);
+        const double syllable = std::max(0.0, std::sin(2.0 * kPi * 2.0 * t + 0.4 * std::sin(2.0 * kPi * 0.3 * t)));
+        out[i]                = static_cast<float>(0.35 * v * syllable);
+    }
+}
+
 }  // namespace
 
 std::vector<SimSource::Carrier> SimSource::carriers(double sample_rate)
@@ -163,6 +213,15 @@ SimSource::BroadcastStation SimSource::broadcast_station(double sample_rate)
             kBroadcastPreEmphasisS};
 }
 
+std::vector<SimSource::DigitalStation> SimSource::digital_stations(double sample_rate)
+{
+    return {{"DMR", kDmrCenter * sample_rate, kDmrLevel, 4800.0, 1944.0, 4},
+            {"POCSAG", kPagerCenter * sample_rate, kPagerLevel, 1200.0, 4500.0, 2},
+            {"P25", kP25Center * sample_rate, kP25Level, 4800.0, 1800.0, 4},
+            {"P25 control", kP25Center * sample_rate + kP25ControlAboveHz, kP25Level, 4800.0, 1800.0, 4},
+            {"P25 Phase 2", kP25Center * sample_rate - kP25Phase2BelowHz, kP25Level, 6000.0, 2250.0, 4}};
+}
+
 SimSource::SimSource(const SourceConfig& config)
     : sample_rate_(config.sample_rate),
       initial_frequency_(config.frequency),
@@ -179,6 +238,36 @@ SimSource::SimSource(const SourceConfig& config)
     info_.has_gain        = true;
     info_.frequency_range = {1e6, 6e9, 1.0};
     info_.gain_range      = {0.0, 60.0, 1.0};
+
+    // DMR: 4800 Bd, levels +/-648 and +/-1944 Hz (values 0..3 = -3, -1, +1, +3),
+    // from a repeater that makes a call now and then.
+    dmr_         = std::make_shared<DmrTransmitter>(kDmrColorCode);
+    dmr_encoder_ = std::make_shared<AmbeEncoder>();
+    Fsk dmr{kDmrCenter, kDmrLevel, 4800.0, {-1944.0, -648.0, 648.0, 1944.0}, {}, 144, 66};
+    dmr.source = [this] { return next_dmr_symbol(); };
+    // POCSAG: 1200 bit/s at +/-4.5 kHz (a 1 is the lower frequency), batches of
+    // 17 codewords starting with the frame sync.
+    Fsk pager{kPagerCenter, kPagerLevel, 1200.0, {4500.0, -4500.0}, {}, 17 * 32, 0};
+    for (int b = 31; b >= 0; --b)
+        pager.sync.push_back(static_cast<int>((kPocsagSync >> b) & 1u));
+    // P25: 4800 Bd, levels +/-600 and +/-1800 Hz, a conventional radio.
+    p25_         = std::make_shared<P25Transmitter>(kP25Nac);
+    p25_encoder_ = std::make_shared<ImbeEncoder>();
+    Fsk p25{kP25Center, kP25Level, 4800.0, {-1800.0, -600.0, 600.0, 1800.0}, {}, 864, 0};
+    p25.source = [this] { return next_p25_symbol(); };
+    // Its control channel.
+    p25_control_ = std::make_shared<P25Transmitter>(kP25Nac);
+    p25_control_->control([this] { return next_p25_block(); });
+    Fsk control{kP25Center + kP25ControlAboveHz / sample_rate_, kP25Level, 4800.0, {-1800.0, -600.0, 600.0, 1800.0}, {}, 360, 0};
+    control.source = [this] { return next_p25_control_symbol(); };
+    // A Phase 2 voice channel: 6000 Bd phase steps of +-45 and +-135 degrees,
+    // sent as their frequencies, +-750 and +-2250 Hz - the scrambling key is
+    // the system's, from the control channel.
+    p25p2_         = std::make_shared<P25Phase2Transmitter>(p25p2::System{kP25Wacn, kP25System, kP25Nac});
+    p25p2_encoder_ = std::make_shared<AmbeEncoder>();
+    Fsk phase2{kP25Center - kP25Phase2BelowHz / sample_rate_, kP25Level, 6000.0, {-2250.0, -750.0, 750.0, 2250.0}, {}, 180, 0};
+    phase2.source = [this] { return next_p25_phase2_symbol(); };
+    fsk_ = {dmr, pager, p25, control, phase2};
 
     tones_ = {
         {-0.36, -30.0, 0.0, 0.0},   // strong steady carrier
@@ -247,6 +336,16 @@ void SimSource::start()
     fm_phase_ = chirp_phase_ = wide_phase_ = hop_phase_ = 0.0;
     voice_phase_ = voice_audio_phase_ = 0.0;
     broadcast_phase_ = broadcast_audio_phase_ = broadcast_pilot_phase_ = 0.0;
+    for (size_t i = 0; i < fsk_.size(); ++i) {
+        Fsk& f      = fsk_[i];
+        f.phase     = 0.0;
+        f.in_symbol = 0.0;
+        f.index     = 0;
+        f.random    = seed_ * 2654435761u + 977u * static_cast<uint32_t>(i + 1);
+        f.prev      = next_fsk_symbol(f);
+        f.curr      = next_fsk_symbol(f);
+        f.next      = next_fsk_symbol(f);
+    }
     chirp_freq_      = kChirpLo;
     wide_pos_ = narrow_pos_ = 0;
     burst_on_ = hop_on_ = false;
@@ -379,6 +478,178 @@ void SimSource::add_broadcast(int n, double shift)
     }
 }
 
+int SimSource::next_fsk_symbol(Fsk& fsk)
+{
+    if (fsk.source)
+        return fsk.source();
+    const size_t at    = fsk.index;
+    fsk.index          = (fsk.index + 1) % fsk.frame;
+    if (at >= fsk.sync_at && at < fsk.sync_at + fsk.sync.size())
+        return fsk.sync[at - fsk.sync_at];
+    // xorshift32: its own random numbers, so the rest of the scene stays as it was.
+    fsk.random ^= fsk.random << 13;
+    fsk.random ^= fsk.random >> 17;
+    fsk.random ^= fsk.random << 5;
+    return static_cast<int>((fsk.random >> 8) % fsk.levels_hz.size());
+}
+
+// The DMR repeater: its calls start on time, and say something.
+int SimSource::next_dmr_symbol()
+{
+    constexpr double kFrameSeconds = 0.03;
+    if (dmr_symbols_ % dmr::kFrameSymbols == 0) {
+        const uint64_t frame     = dmr_symbols_ / dmr::kFrameSymbols;
+        const auto     per_cycle = static_cast<uint64_t>(std::lround(kDmrCycleSeconds / kFrameSeconds));
+        for (const DmrCall& c : kDmrCalls) {
+            if (frame % per_cycle != static_cast<uint64_t>(std::lround(c.start / kFrameSeconds)))
+                continue;
+            dmr::LinkControl lc;
+            lc.destination = c.talkgroup;
+            lc.source      = c.source;
+            dmr_encoder_->reset();
+            const int superframes = std::max(1, static_cast<int>(std::lround(c.seconds / 0.36)));
+            dmr_->start_call(c.slot, lc, superframes, [this] {
+                // Without a vocoder there is no point in speaking: it sends silence.
+                if (!AmbeEncoder::available())
+                    return dmr::ambe_silence();
+                float speech[AmbeEncoder::kFrameSamples];
+                synthetic_speech(dmr_speech_, AmbeEncoder::kFrameSamples, 8000.0, speech);
+                dmr_speech_ += AmbeEncoder::kFrameSamples;
+                for (float& v : speech)
+                    v *= 0.3f;
+                return dmr_encoder_->encode(speech);
+            });
+        }
+    }
+    ++dmr_symbols_;
+    return (dmr_->next_symbol() + 3) / 2;
+}
+
+// The P25 radio: on the air for its call.
+int SimSource::next_p25_symbol()
+{
+    const auto per_cycle = static_cast<uint64_t>(std::llround(kDmrCycleSeconds * 4800.0));
+    if (p25_symbols_ % per_cycle == static_cast<uint64_t>(std::llround(kP25Call.start * 4800.0))) {
+        p25::LinkControl lc;
+        lc.destination = kP25Call.talkgroup;
+        lc.source      = kP25Call.source;
+        p25_encoder_->reset();
+        const int ldus = std::max(2, static_cast<int>(std::lround(kP25Call.seconds / 0.18)));
+        p25_->start_call(lc, ldus, [this] {
+            if (!ImbeEncoder::available())
+                return p25::ImbeFrame{};
+            float speech[ImbeEncoder::kFrameSamples];
+            synthetic_speech(p25_speech_ + 40000, ImbeEncoder::kFrameSamples, 8000.0, speech);  // another voice
+            p25_speech_ += ImbeEncoder::kFrameSamples;
+            for (float& v : speech)
+                v *= 0.3f;
+            return p25_encoder_->encode(speech);
+        });
+    }
+    ++p25_symbols_;
+    int symbol = 0;
+    return p25_->next_symbol(symbol) ? (symbol + 3) / 2 : -1;
+}
+
+int SimSource::next_p25_control_symbol()
+{
+    int symbol = 0;
+    return p25_control_->next_symbol(symbol) ? (symbol + 3) / 2 : -1;
+}
+
+// The Phase 2 voice channel: on the air for its call.
+int SimSource::next_p25_phase2_symbol()
+{
+    const auto per_cycle = static_cast<uint64_t>(std::llround(kDmrCycleSeconds * p25p2::kSymbolRate));
+    if (p25p2_symbols_ % per_cycle == static_cast<uint64_t>(std::llround(kP25Phase2Call.start * p25p2::kSymbolRate))) {
+        p25p2_encoder_->reset();
+        const int superframes = std::max(1, static_cast<int>(std::lround(kP25Phase2Call.seconds / 0.36)));
+        p25p2_->start_call(kP25Phase2Call.slot, static_cast<uint16_t>(kP25Phase2Call.talkgroup), kP25Phase2Call.source,
+                           superframes, [this] {
+                               if (!AmbeEncoder::available())
+                                   return dmr::ambe_silence();
+                               float speech[AmbeEncoder::kFrameSamples];
+                               synthetic_speech(p25p2_speech_ + 80000, AmbeEncoder::kFrameSamples, 8000.0, speech);
+                               p25p2_speech_ += AmbeEncoder::kFrameSamples;
+                               for (float& v : speech)
+                                   v *= 0.3f;
+                               return p25p2_encoder_->encode(speech);
+                           });
+    }
+    ++p25p2_symbols_;
+    int symbol = 0;
+    return p25p2_->next_symbol(symbol) ? (symbol + 3) / 2 : -1;
+}
+
+// What the control channel says: who the system is, the channel plans - an
+// FDMA one that puts the P25 radio on channel 10, a TDMA one with the Phase 2
+// channel - and while either talks, its grant.
+p25::Tsbk SimSource::next_p25_block()
+{
+    const double   voice_hz        = initial_frequency_ + kP25Center * sample_rate_;
+    const double   base_hz         = voice_hz - 10 * 12.5e3;
+    const uint16_t voice_channel   = 0x1000 | 10;
+    const uint16_t control_channel = static_cast<uint16_t>(0x1000 | (10 + std::lround(kP25ControlAboveHz / 12.5e3)));
+    // Plan 2 counts two slots to a carrier.
+    const auto     phase2_carrier  = static_cast<uint16_t>(10 - std::lround(kP25Phase2BelowHz / 12.5e3));
+    const auto     phase2_channel  = static_cast<uint16_t>(0x2000 | (2 * phase2_carrier + kP25Phase2Call.slot));
+    const uint64_t block           = p25_blocks_++ % 6;
+    switch (block) {
+    case 0: return tsbk::network_status(kP25Wacn, kP25System, control_channel);
+    case 1: return tsbk::rfss_status(kP25System, 1, 2, control_channel);
+    case 2: return tsbk::channel_plan(1, base_hz, 12.5e3, -45e6);
+    case 3: return tsbk::channel_plan_tdma(2, 3, base_hz, 12.5e3, -45e6);
+    default:
+        if (p25_->on_air())
+            return tsbk::group_grant(voice_channel, kP25Call.talkgroup, kP25Call.source);
+        if (p25p2_->on_air())
+            return tsbk::group_grant(phase2_channel, static_cast<uint16_t>(kP25Phase2Call.talkgroup), kP25Phase2Call.source);
+        return block == 4 ? tsbk::channel_plan(1, base_hz, 12.5e3, -45e6)
+                          : tsbk::channel_plan_tdma(2, 3, base_hz, 12.5e3, -45e6);
+    }
+}
+
+void SimSource::add_fsk(Fsk& fsk, int n, double shift)
+{
+    // Like add_voice(): the frequency is held over segments of at most 5 us,
+    // and never across a symbol boundary.  Between symbols it moves on a
+    // raised-cosine curve over half a symbol, so the transmitter stays within
+    // its channel.
+    const double center = fsk.center + shift;
+    const double step   = fsk.rate / sample_rate_;  // symbols per sample
+    const bool   on_air = in_band(center, kDigitalHalfWidthHz / sample_rate_);
+    const double amp    = amplitude(fsk.level_dbfs);
+    const int    max_seg = std::clamp(static_cast<int>(sample_rate_ / 200e3), 1, 64);
+    const auto   blend  = [](double a, double b, double w) { return a + (b - a) * (0.5 - 0.5 * std::cos(kPi * w)); };
+
+    for (int done = 0; done < n;) {
+        const int to_boundary = std::max(1, static_cast<int>(std::ceil((1.0 - fsk.in_symbol) / step)));
+        const int seg         = std::min({max_seg, n - done, to_boundary});
+        const double u        = std::min(fsk.in_symbol + 0.5 * seg * step, 0.9999);
+        const auto   level = [&](int i) { return i < 0 ? 0.0 : fsk.levels_hz[static_cast<size_t>(i)]; };  // -1: off air
+        const double prev  = level(fsk.prev);
+        const double curr  = level(fsk.curr);
+        const double next  = level(fsk.next);
+        double       dev  = curr;
+        if (u < 0.25)
+            dev = blend(prev, curr, (u + 0.25) / 0.5);
+        else if (u > 0.75)
+            dev = blend(curr, next, (u - 0.75) / 0.5);
+        const double dphi = kTwoPi * (center + dev / sample_rate_);
+        if (on_air && fsk.curr >= 0)
+            rotate_add(mix_.data() + 2 * done, seg, fsk.phase, dphi, amp);
+        fsk.phase = std::fmod(fsk.phase + dphi * seg, kTwoPi);
+        fsk.in_symbol += seg * step;
+        while (fsk.in_symbol >= 1.0 - 1e-9) {
+            fsk.in_symbol = std::max(0.0, fsk.in_symbol - 1.0);
+            fsk.prev      = fsk.curr;
+            fsk.curr      = fsk.next;
+            fsk.next      = next_fsk_symbol(fsk);
+        }
+        done += seg;
+    }
+}
+
 void SimSource::add_chirp(int n, double shift)
 {
     // Linear sweep across most of the band, restarting at the bottom.
@@ -506,6 +777,8 @@ void SimSource::generate(int n)
     add_fm(n, shift);
     add_voice(n, shift);
     add_broadcast(n, shift);
+    for (Fsk& fsk : fsk_)
+        add_fsk(fsk, n, shift);
     add_chirp(n, shift);
     add_bursts(n, shift);
     add_hopper(n, shift);
