@@ -66,9 +66,21 @@ precision) and **zlib**. **librtlsdr** is optional and adds RTL-SDR support. On
 Debian/Ubuntu:
 
 ```sh
+sudo apt update
 sudo apt install build-essential cmake ninja-build pkg-config \
-                 libbladerf-dev librtlsdr-dev libfftw3-dev zlib1g-dev
+                 libbladerf-dev librtlsdr-dev libfftw3-dev zlib1g-dev \
+                 libxkbcommon-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+                 libxi-dev libgl1-mesa-dev \
+                 libvulkan1 mesa-vulkan-drivers vulkan-tools \
+                 libglfw3-dev glslang-tools
 ```
+
+`libglfw3-dev` and `glslang-tools` let the build use the system's GLFW and GLSL
+compiler instead of building them from source, which makes the first build
+quicker. The X11, xkbcommon and GL development packages are what GLFW needs if
+it is built from source anyway (see below). `libvulkan1` and `mesa-vulkan-drivers` give you
+the Vulkan loader and driver at runtime, and `vulkan-tools` adds `vulkaninfo` and
+`vkcube`, which help check that Vulkan works.
 
 Then:
 
