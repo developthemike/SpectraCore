@@ -9,6 +9,7 @@
 
 #include <GLFW/glfw3.h>
 
+#include "gfx/vk_portability.hpp"
 #include "util/log.hpp"
 
 namespace spectro {
@@ -114,6 +115,45 @@ VkApplicationInfo application_info()
     return app;
 }
 
+std::vector<std::string> available_instance_extensions()
+{
+    uint32_t count = 0;
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr) != VK_SUCCESS || count == 0)
+        return {};
+    std::vector<VkExtensionProperties> props(count);
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &count, props.data()) != VK_SUCCESS)
+        return {};
+    props.resize(count);
+    std::vector<std::string> names;
+    names.reserve(props.size());
+    for (const VkExtensionProperties& p : props)
+        names.emplace_back(p.extensionName);
+    return names;
+}
+
+std::vector<std::string> available_device_extensions(VkPhysicalDevice gpu)
+{
+    uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, nullptr) != VK_SUCCESS || count == 0)
+        return {};
+    std::vector<VkExtensionProperties> props(count);
+    if (vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, props.data()) != VK_SUCCESS)
+        return {};
+    props.resize(count);
+    std::vector<std::string> names;
+    names.reserve(props.size());
+    for (const VkExtensionProperties& p : props)
+        names.emplace_back(p.extensionName);
+    return names;
+}
+
+constexpr VkInstanceCreateFlags kEnumeratePortabilityBit =
+#ifdef VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+    VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#else
+    0x00000001u;
+#endif
+
 }  // namespace
 
 void vk_check(VkResult result, const char* what)
@@ -191,10 +231,13 @@ void VulkanContext::create_instance(bool want_validation)
         throw std::runtime_error(
             "Vulkan cannot present to a window on this system (no Vulkan driver with surface support was found)");
     }
-    std::vector<const char*> extensions(glfw_extensions, glfw_extensions + glfw_count);
-    std::vector<const char*> layers;
+    std::vector<std::string> required_extensions;
+    required_extensions.reserve(glfw_count);
+    for (uint32_t i = 0; i < glfw_count; ++i)
+        required_extensions.emplace_back(glfw_extensions[i]);
 
-    bool validation = false;
+    std::vector<const char*> layers;
+    bool                     validation = false;
     if (want_validation) {
         uint32_t layer_count = 0;
         vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
@@ -206,18 +249,25 @@ void VulkanContext::create_instance(bool want_validation)
         }
         if (validation) {
             layers.push_back("VK_LAYER_KHRONOS_validation");
-            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
             LOG_INFO("Vulkan validation layers enabled");
         } else {
             LOG_WARN("--validate: the Vulkan validation layers are not installed; continuing without them");
         }
     }
 
+    const VulkanInstancePlan plan =
+        plan_vulkan_instance(required_extensions, available_instance_extensions(), validation);
+    std::vector<const char*> extensions;
+    extensions.reserve(plan.extensions.size());
+    for (const std::string& ext : plan.extensions)
+        extensions.push_back(ext.c_str());
+
     const VkApplicationInfo            app   = application_info();
     VkDebugUtilsMessengerCreateInfoEXT debug = debug_messenger_info();
 
     VkInstanceCreateInfo info{};
     info.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    info.flags                   = plan.enumerate_portability ? kEnumeratePortabilityBit : 0;
     info.pApplicationInfo        = &app;
     info.enabledExtensionCount   = static_cast<uint32_t>(extensions.size());
     info.ppEnabledExtensionNames = extensions.data();
@@ -360,15 +410,20 @@ void VulkanContext::create_device()
     queue_info.queueCount       = 1;
     queue_info.pQueuePriorities = &priority;
 
-    const char*              extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    const std::vector<std::string> planned = plan_vulkan_device_extensions(available_device_extensions(physical_device));
+    std::vector<const char*>       extensions;
+    extensions.reserve(planned.size());
+    for (const std::string& ext : planned)
+        extensions.push_back(ext.c_str());
+
     VkPhysicalDeviceFeatures features{};  // no optional features are needed
 
     VkDeviceCreateInfo info{};
     info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     info.queueCreateInfoCount    = 1;
     info.pQueueCreateInfos       = &queue_info;
-    info.enabledExtensionCount   = 1;
-    info.ppEnabledExtensionNames = extensions;
+    info.enabledExtensionCount   = static_cast<uint32_t>(extensions.size());
+    info.ppEnabledExtensionNames = extensions.data();
     info.pEnabledFeatures        = &features;
     vk_check(vkCreateDevice(physical_device, &info, nullptr, &device), "creating the device");
     vkGetDeviceQueue(device, queue_family, 0, &queue);
@@ -684,13 +739,23 @@ int list_gpus()
     // must be the ones --gpu accepts.
     uint32_t                 glfw_count      = 0;
     const char**             glfw_extensions = glfwGetRequiredInstanceExtensions(&glfw_count);
+    std::vector<std::string> required_extensions;
+    if (glfw_extensions) {
+        required_extensions.reserve(glfw_count);
+        for (uint32_t i = 0; i < glfw_count; ++i)
+            required_extensions.emplace_back(glfw_extensions[i]);
+    }
+    const VulkanInstancePlan plan =
+        plan_vulkan_instance(required_extensions, available_instance_extensions(), false);
     std::vector<const char*> extensions;
-    if (glfw_extensions)
-        extensions.assign(glfw_extensions, glfw_extensions + glfw_count);
+    extensions.reserve(plan.extensions.size());
+    for (const std::string& ext : plan.extensions)
+        extensions.push_back(ext.c_str());
 
     const VkApplicationInfo app = application_info();
     VkInstanceCreateInfo    info{};
     info.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    info.flags                   = plan.enumerate_portability ? kEnumeratePortabilityBit : 0;
     info.pApplicationInfo        = &app;
     info.enabledExtensionCount   = static_cast<uint32_t>(extensions.size());
     info.ppEnabledExtensionNames = extensions.data();

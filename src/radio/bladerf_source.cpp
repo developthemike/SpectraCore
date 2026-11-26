@@ -34,8 +34,12 @@ std::string open_error_message(int status, const std::string& device)
     msg += bladerf_strerror(status);
     msg += ".";
     if (status == BLADERF_ERR_NODEV) {
+#if defined(__APPLE__)
+        msg += " Check that it is plugged in and that no other program (bladeRF-cli, GNU Radio, ...) is using it.";
+#else
         msg += " Check that it is plugged in, that no other program (bladeRF-cli, GNU Radio, ...) "
                "is using it, and that this user may access it (udev rules / 'plugdev' group).";
+#endif
     }
     return msg;
 }

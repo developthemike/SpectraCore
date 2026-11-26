@@ -60,6 +60,7 @@ add_library(spectro_core STATIC
     src/util/log.cpp
     src/util/units.cpp
     src/util/json.cpp
+    src/gfx/vk_portability.cpp
     src/dsp/window.cpp
     src/dsp/spectrum_engine.cpp
     src/dsp/fm_demod.cpp
@@ -187,7 +188,8 @@ if(SPECTRO_BUILD_TESTS)
         tests/test_p25_phase2.cpp
         tests/test_follow.cpp
         tests/test_control_channels.cpp
-        tests/test_transcribe.cpp)
+        tests/test_transcribe.cpp
+        tests/test_platform.cpp)
     target_link_libraries(spectro_tests PRIVATE spectro_core spectro_flags)
     if(SPECTRO_HAVE_WHISPER)
         # A recording of speech that comes with whisper.cpp, for a test that

@@ -12,6 +12,7 @@
 
 #include "audio/control_channels.hpp"
 #include "audio/listener.hpp"
+#include "util/platform.hpp"
 #include "util/units.hpp"
 
 namespace spectro {
@@ -197,7 +198,11 @@ std::vector<Flag> make_flags(Options& o, Given& given)
         });
 
     // ---- Listening ----
+#if defined(__APPLE__)
+    add("--listen", "HZ", "Play the FM signal at this frequency (in the window: Cmd + click)",
+#else
     add("--listen", "HZ", "Play the FM signal at this frequency (in the window: Ctrl + click)",
+#endif
         [&o](const std::string& v, std::string& e) {
             if (!parse_number(v, o.listen_frequency, e, "frequency"))
                 return false;
@@ -462,6 +467,10 @@ bool parse_options(int argc, char** argv, Options& options, std::string& error)
 
     if (options.scan && !std::isnan(options.listen_frequency)) {
         error = "--scan and --listen exclude each other";
+        return false;
+    }
+    if (const std::string platform_error = validate_window_platform(options.platform); !platform_error.empty()) {
+        error = platform_error;
         return false;
     }
     if (options.source.kind == "file" && options.source.file_path.empty()) {

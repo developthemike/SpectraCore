@@ -48,14 +48,26 @@ std::string open_error_message(int status, const std::string& device)
         msg += " '" + device + "'";
     msg += " (error " + std::to_string(status) + ").";
     if (status == -3) {  // LIBUSB_ERROR_ACCESS
+#if defined(__APPLE__)
+        msg += " Check that this user has permission to access the USB device and try reconnecting it.";
+#else
         msg += " This user may not access it: install the udev rules that come with librtlsdr "
                "(package 'rtl-sdr') and plug the dongle in again.";
+#endif
     } else if (status == -6) {  // LIBUSB_ERROR_BUSY
+#if defined(__APPLE__)
+        msg += " It is in use by another program (rtl_tcp, GQRX, SDR++, ...).";
+#else
         msg += " It is in use by another program (rtl_tcp, GQRX, ...) or by the kernel's DVB-T driver "
                "(unload it with 'sudo rmmod dvb_usb_rtl28xxu', or blacklist it).";
+#endif
     } else {
+#if defined(__APPLE__)
+        msg += " Check that it is plugged in and that no other program (rtl_tcp, GQRX, SDR++, ...) is using it.";
+#else
         msg += " Check that no other program (rtl_tcp, GQRX, ...) or the kernel's DVB-T driver "
                "(dvb_usb_rtl28xxu) is using it, and that this user may access it (udev rules).";
+#endif
     }
     return msg;
 }
@@ -110,8 +122,12 @@ void RtlSdrSource::start()
     const uint32_t count = rtlsdr_get_device_count();
     if (count == 0) {
         throw std::runtime_error(
+#if defined(__APPLE__)
+            "No RTL-SDR was found. Check that it is plugged in and recognised by macOS.");
+#else
             "No RTL-SDR was found. Check that it is plugged in and that this user may access it "
             "(the udev rules that come with librtlsdr, package 'rtl-sdr').");
+#endif
     }
     uint32_t index = 0;
     if (!config_.device.empty()) {
@@ -244,7 +260,7 @@ void RtlSdrSource::start()
             stream_result_   = 0;
         }
         consecutive_timeouts_ = 0;
-        thread_ = std::thread([this, buffer_count, buffer_bytes] { stream_thread(buffer_count, buffer_bytes); });
+        thread_ = std::thread(&RtlSdrSource::stream_thread, this, buffer_count, buffer_bytes);
 
         // Wait for the first samples, which proves that they are flowing.
         {
