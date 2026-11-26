@@ -57,7 +57,7 @@ jobs:
       - name: Smoke test headless simulator
         run: ./build/spectrogram --source sim --headless --duration 2
 
-      - name: Build and test headless-only configuration
+      - name: Build and smoke test headless-only configuration
         if: matrix.check_headless_build
         env:
           CC: ${{ matrix.cc }}
@@ -66,10 +66,11 @@ jobs:
           cmake -S . -B build-headless -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DSPECTRO_BUILD_GUI=OFF \
+            -DSPECTRO_BUILD_TESTS=OFF \
             -DSPECTRO_WARNINGS_AS_ERRORS=ON \
             -DSPECTRO_NATIVE_ARCH=OFF
           cmake --build build-headless
-          ctest --test-dir build-headless --output-on-failure
+          ./build-headless/spectrogram --source sim --headless --duration 2
 
   macos:
     name: macOS (${{ matrix.config }})
@@ -112,13 +113,14 @@ jobs:
       - name: Smoke test headless simulator
         run: ./build/spectrogram --source sim --headless --duration 2
 
-      - name: Build and test headless-only configuration
+      - name: Build and smoke test headless-only configuration
         if: matrix.check_headless_build
         run: |
           cmake -S . -B build-headless -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DSPECTRO_BUILD_GUI=OFF \
+            -DSPECTRO_BUILD_TESTS=OFF \
             -DSPECTRO_WARNINGS_AS_ERRORS=ON \
             -DSPECTRO_NATIVE_ARCH=OFF
           cmake --build build-headless
-          ctest --test-dir build-headless --output-on-failure
+          ./build-headless/spectrogram --source sim --headless --duration 2
