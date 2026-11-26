@@ -1,9 +1,10 @@
 #include "util/json.hpp"
 
 #include <cctype>
-#include <charconv>
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
-#include <system_error>
+#include <cstdlib>
 
 namespace spectro {
 
@@ -158,14 +159,18 @@ private:
         if (pos_ < text_.size() && (std::isalnum(static_cast<unsigned char>(text_[pos_])) || text_[pos_] == '.'))
             return fail("invalid number");
 
-        const char* const first  = text_.data() + start;
-        const char* const last   = text_.data() + pos_;
-        const auto        result = std::from_chars(first, last, value.number);
-        if (result.ec == std::errc::result_out_of_range)
+        // Use std::strtod rather than floating-point std::from_chars, which
+        // Apple's libc++ did not ship prior to Xcode 26.
+        const std::string token(text_.substr(start, pos_ - start));
+        char*             end    = nullptr;
+        errno                    = 0;
+        const double      parsed = std::strtod(token.c_str(), &end);
+        if (errno == ERANGE || !std::isfinite(parsed))
             return fail("number out of range");
-        if (result.ec != std::errc() || result.ptr != last)
+        if (end != token.c_str() + token.size())
             return fail("invalid number");
-        value.type = JsonValue::Type::Number;
+        value.number = parsed;
+        value.type   = JsonValue::Type::Number;
         return true;
     }
 
@@ -294,7 +299,7 @@ private:
             JsonValue member;
             if (!parse_value(member, depth + 1))
                 return false;
-            value.members.emplace_back(std::move(key), std::move(member));
+            value.members.push_back({std::move(key), std::move(member)});
             const char c = peek();
             if (c == '}') {
                 ++pos_;

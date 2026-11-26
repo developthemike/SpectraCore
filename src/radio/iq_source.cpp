@@ -40,7 +40,11 @@ std::unique_ptr<IqSource> make_source(const SourceConfig& config)
 #else
         throw std::runtime_error(
             "This build has no bladeRF support (libbladeRF was not found when it was compiled). "
+#if defined(__APPLE__)
+            "Use --source sim or --source file, or install libbladerf (brew install libbladerf) and rebuild.");
+#else
             "Use --source sim or --source file, or install libbladerf-dev and rebuild.");
+#endif
 #endif
     }
     if (config.kind == "rtlsdr") {
@@ -49,7 +53,11 @@ std::unique_ptr<IqSource> make_source(const SourceConfig& config)
 #else
         throw std::runtime_error(
             "This build has no RTL-SDR support (librtlsdr was not found when it was compiled). "
+#if defined(__APPLE__)
+            "Use --source sim or --source file, or install librtlsdr (brew install librtlsdr) and rebuild.");
+#else
             "Use --source sim or --source file, or install librtlsdr-dev and rebuild.");
+#endif
 #endif
     }
     if (config.kind == "sim")

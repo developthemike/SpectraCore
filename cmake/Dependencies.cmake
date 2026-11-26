@@ -90,10 +90,15 @@ if(SPECTRO_WITH_BLADERF)
     if(SPECTRO_HAVE_BLADERF)
         message(STATUS "libbladeRF: found")
     else()
+        if(APPLE)
+            set(_bladerf_hint "brew install libbladerf")
+        else()
+            set(_bladerf_hint "sudo apt install libbladerf-dev")
+        endif()
         message(WARNING
             "libbladeRF was not found: building WITHOUT radio support "
             "(only the simulator and file playback will work). "
-            "Install it with e.g. 'sudo apt install libbladerf-dev'.")
+            "Install it with e.g. '${_bladerf_hint}'.")
     endif()
 else()
     message(STATUS "libbladeRF: disabled (SPECTRO_WITH_BLADERF=OFF)")
@@ -120,9 +125,14 @@ if(SPECTRO_WITH_RTLSDR)
     if(SPECTRO_HAVE_RTLSDR)
         message(STATUS "librtlsdr: found")
     else()
+        if(APPLE)
+            set(_rtlsdr_hint "brew install librtlsdr")
+        else()
+            set(_rtlsdr_hint "sudo apt install librtlsdr-dev")
+        endif()
         message(STATUS
             "librtlsdr: not found, building without RTL-SDR support "
-            "(install it with e.g. 'sudo apt install librtlsdr-dev')")
+            "(install it with e.g. '${_rtlsdr_hint}')")
     endif()
 else()
     message(STATUS "librtlsdr: disabled (SPECTRO_WITH_RTLSDR=OFF)")
@@ -177,6 +187,10 @@ if(SPECTRO_WITH_WHISPER)
     set(GGML_CCACHE            OFF CACHE BOOL "" FORCE)
     set(GGML_OPENMP            OFF CACHE BOOL "" FORCE)  # its own thread pool will do
     set(GGML_NATIVE            ${SPECTRO_NATIVE_ARCH} CACHE BOOL "" FORCE)
+    if(APPLE)
+        # Keep the Metal shader library embedded so the binary stays self-contained.
+        set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+    endif()
     # Static, whatever the rest of the build does: whisper.cpp's project would
     # build shared libraries, and older CMake policies would let it.
     set(_spectro_shared_libs ${BUILD_SHARED_LIBS})
@@ -212,15 +226,27 @@ if(Vulkan_FOUND)
     target_link_libraries(spectro_vulkan INTERFACE Vulkan::Vulkan)
     message(STATUS "Vulkan: system SDK/dev package (${Vulkan_VERSION})")
 else()
-    # No development package.  The loader itself ships with every GPU driver, so
-    # link against the runtime library and bring our own headers.
-    find_library(SPECTRO_VULKAN_LOADER NAMES vulkan libvulkan.so.1 vulkan-1)
+    # No development package.  The loader itself ships with every GPU driver
+    # (or via Homebrew / the Vulkan SDK on macOS), so link against the runtime
+    # library and bring our own headers.
+    find_library(SPECTRO_VULKAN_LOADER
+        NAMES vulkan libvulkan.so.1 vulkan-1
+        HINTS ENV VULKAN_SDK
+        PATH_SUFFIXES lib)
     if(NOT SPECTRO_VULKAN_LOADER)
+        if(APPLE)
+            set(_vulkan_hint "brew install vulkan-loader molten-vk")
+        else()
+            set(_vulkan_hint "sudo apt install libvulkan1 mesa-vulkan-drivers")
+        endif()
         message(FATAL_ERROR
-            "The Vulkan loader (libvulkan) was not found. Install your GPU's Vulkan "
-            "driver, e.g. 'sudo apt install libvulkan1 mesa-vulkan-drivers'.")
+            "The Vulkan loader (libvulkan) was not found. Install a Vulkan loader/driver, "
+            "e.g. '${_vulkan_hint}'.")
     endif()
-    find_path(SPECTRO_VULKAN_INCLUDE_DIR NAMES vulkan/vulkan.h)
+    find_path(SPECTRO_VULKAN_INCLUDE_DIR
+        NAMES vulkan/vulkan.h
+        HINTS ENV VULKAN_SDK
+        PATH_SUFFIXES include)
     if(NOT SPECTRO_VULKAN_INCLUDE_DIR)
         spectro_fetch_sources(vulkan_headers
             "${SPECTRO_VULKAN_HEADERS_URL}" ${SPECTRO_VULKAN_HEADERS_SHA256})
@@ -247,7 +273,8 @@ else()
     set(SPECTRO_GLFW_RUNTIME_USABLE FALSE)
     if(SPECTRO_GLFW_RUNTIME)
         get_filename_component(_glfw_real "${SPECTRO_GLFW_RUNTIME}" REALPATH)
-        if(_glfw_real MATCHES "\\.so\\.([0-9]+)\\.([0-9]+)")
+        if(_glfw_real MATCHES "\\.so\\.([0-9]+)\\.([0-9]+)" OR
+           _glfw_real MATCHES "\\.([0-9]+)\\.([0-9]+)\\.dylib$")
             # (Nested on purpose: CMAKE_MATCH_n is only set once MATCHES has run.)
             if("${CMAKE_MATCH_1}.${CMAKE_MATCH_2}" VERSION_GREATER_EQUAL "3.4")
                 set(SPECTRO_GLFW_RUNTIME_USABLE TRUE)
@@ -262,7 +289,11 @@ else()
         message(STATUS "GLFW: fetched headers + system runtime ${SPECTRO_GLFW_RUNTIME}")
     else()
         if(NOT SPECTRO_FETCH_MISSING)
-            message(FATAL_ERROR "GLFW is not installed (try 'sudo apt install libglfw3-dev').")
+            if(APPLE)
+                message(FATAL_ERROR "GLFW is not installed (try 'brew install glfw').")
+            else()
+                message(FATAL_ERROR "GLFW is not installed (try 'sudo apt install libglfw3-dev').")
+            endif()
         endif()
         # Build GLFW from source.  This needs the X11 and/or Wayland development
         # headers; GLFW's own configure step reports what is missing.
@@ -318,6 +349,18 @@ if(SPECTRO_WITH_AUDIO)
         MA_NO_NODE_GRAPH
         MA_NO_ENGINE)
     target_link_libraries(spectro_miniaudio PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+    if(APPLE)
+        # Link Apple's audio frameworks directly rather than dlopen()ing them at
+        # run time; they are always part of the macOS SDK.
+        find_library(SPECTRO_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+        find_library(SPECTRO_COREAUDIO_FRAMEWORK      CoreAudio      REQUIRED)
+        find_library(SPECTRO_AUDIOTOOLBOX_FRAMEWORK   AudioToolbox   REQUIRED)
+        target_compile_definitions(spectro_miniaudio PRIVATE MA_NO_RUNTIME_LINKING)
+        target_link_libraries(spectro_miniaudio PUBLIC
+            "${SPECTRO_COREFOUNDATION_FRAMEWORK}"
+            "${SPECTRO_COREAUDIO_FRAMEWORK}"
+            "${SPECTRO_AUDIOTOOLBOX_FRAMEWORK}")
+    endif()
     if(UNIX)
         target_link_libraries(spectro_miniaudio PUBLIC m)
     endif()
@@ -342,8 +385,12 @@ elseif(SPECTRO_GLSLANG)
     message(STATUS "Shader compiler: ${SPECTRO_GLSLANG}")
 else()
     if(NOT SPECTRO_FETCH_MISSING)
-        message(FATAL_ERROR
-            "No GLSL compiler found (try 'sudo apt install glslc' or 'glslang-tools').")
+        if(APPLE)
+            message(FATAL_ERROR "No GLSL compiler found (try 'brew install glslang').")
+        else()
+            message(FATAL_ERROR
+                "No GLSL compiler found (try 'sudo apt install glslc' or 'glslang-tools').")
+        endif()
     endif()
     # Build the reference compiler as a host tool.  Needs Python 3 at build time.
     set(ENABLE_OPT             OFF CACHE BOOL "" FORCE)  # would need SPIRV-Tools

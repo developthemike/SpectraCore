@@ -28,7 +28,6 @@ constexpr float  kTargetRms      = 0.1f;   // -20 dBFS
 constexpr float  kMaxGain        = 30.0f;  // +30 dB at most
 constexpr double kTailSeconds    = 0.3;    // of silence after the speech, to let its last word end
 constexpr double kShortestSeconds = 1.0;   // Whisper is unsure of less
-constexpr int    kBeamSize       = 5;
 constexpr int    kMostRepeats    = 3;      // more of the same word in a row is Whisper stuck in a loop
 
 bool alphanumeric(unsigned char c)
@@ -39,6 +38,8 @@ bool alphanumeric(unsigned char c)
 }
 
 #if SPECTRO_HAVE_WHISPER
+constexpr int kBeamSize = 5;
+
 // whisper.cpp tells a lot as it loads: only its warnings and errors are worth passing on.
 void whisper_log(ggml_log_level level, const char* text, void*)
 {

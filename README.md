@@ -60,10 +60,13 @@ in the 3D view with the control panel, as a 2D waterfall, and as a spectrum.
 
 ## Building
 
-Requirements: Linux, a C++20 compiler (developed with GCC 15), CMake 3.28 or
-newer, and the development packages of **libbladeRF**, **FFTW 3** (single
-precision) and **zlib**. **librtlsdr** is optional and adds RTL-SDR support. On
-Debian/Ubuntu:
+Requirements: Linux or macOS, a C++20 compiler (GCC, Clang or Apple Clang),
+CMake 3.28 or newer, and the development packages of **FFTW 3** (single
+precision) and **zlib**. **libbladeRF** and **librtlsdr** are optional and add
+hardware radio support (without them, the simulator and file playback still
+work).
+
+### Linux (Debian/Ubuntu)
 
 ```sh
 sudo apt update
@@ -82,7 +85,23 @@ it is built from source anyway (see below). `libvulkan1` and `mesa-vulkan-driver
 the Vulkan loader and driver at runtime, and `vulkan-tools` adds `vulkaninfo` and
 `vkcube`, which help check that Vulkan works.
 
-Then:
+### macOS (Homebrew)
+
+Install Xcode Command Line Tools (`xcode-select --install`), then install the
+build and Vulkan (MoltenVK) dependencies with [Homebrew](https://brew.sh):
+
+```sh
+brew install cmake ninja pkg-config \
+             fftw glfw glslang vulkan-loader vulkan-headers molten-vk \
+             libbladerf librtlsdr
+```
+
+`libbladerf` and `librtlsdr` can be omitted if you only want the simulator or
+file playback. For `--validate`, also install `vulkan-validationlayers` (and set
+`VK_LAYER_PATH=$(brew --prefix vulkan-validationlayers)/share/vulkan/explicit_layer.d`).
+The LunarG Vulkan SDK for macOS works as well.
+
+### Build and run
 
 ```sh
 cmake -S . -B build -G Ninja
@@ -96,18 +115,19 @@ SHA-256 hashes; nothing is installed system-wide):
 
 | Dependency | System package used if present | Otherwise |
 | --- | --- | --- |
-| Vulkan headers | `libvulkan-dev` | headers fetched; links the Vulkan loader that ships with your GPU driver |
-| GLFW | `libglfw3-dev` | headers fetched if the GLFW 3.4+ runtime library is installed, else built from source |
-| GLSL compiler | `glslc` or `glslang-tools` | glslang built from source (needs Python 3; adds about half a minute to the first build) |
+| Vulkan headers | `libvulkan-dev` / `vulkan-headers` | headers fetched; links the system Vulkan loader |
+| GLFW | `libglfw3-dev` / `glfw` | headers fetched if the GLFW 3.4+ runtime library is installed, else built from source |
+| GLSL compiler | `glslc`, `glslang-tools` / `glslang` | glslang built from source (needs Python 3; adds about half a minute to the first build) |
 | Dear ImGui | — | always fetched and compiled in |
 | miniaudio (sound output) | — | always fetched and compiled in |
 | mbelib-neo (DMR and P25 voice) | — | fetched and compiled in only with `SPECTRO_WITH_MBELIB=ON` |
 | whisper.cpp (speech to text) | — | fetched and compiled in only with `SPECTRO_WITH_WHISPER=ON` |
 
-Sound goes out through PulseAudio / PipeWire, ALSA or JACK, whichever is
-running; building needs none of their development packages.
+Sound goes out through CoreAudio on macOS, or PulseAudio / PipeWire, ALSA or
+JACK on Linux, whichever is running; building needs no extra audio packages.
 
-At run time you need a Vulkan-capable GPU driver (e.g. `mesa-vulkan-drivers`).
+At run time you need a Vulkan-capable GPU driver (`mesa-vulkan-drivers` on
+Linux, or `molten-vk` / the Vulkan SDK on macOS).
 
 CMake options:
 
@@ -170,7 +190,8 @@ cmake -S . -B build -G Ninja -DSPECTRO_WITH_MBELIB=ON -DSPECTRO_WITH_WHISPER=ON
 ```
 
 which downloads whisper.cpp 1.9.5 (pinned and checked against its SHA-256
-hash, like the other downloads) and compiles it in, for the CPU only. It is
+hash, like the other downloads) and compiles it in (CPU on Linux; Accelerate
+and Metal on macOS, with the Metal shader library embedded). It is
 MIT licensed. Speech to text needs the vocoders too (above): without them
 there is no voice to write out.
 
@@ -594,13 +615,13 @@ scanner looks for signals itself:
 | Right or middle drag, Shift + left drag | Move the view |
 | Mouse wheel | Zoom |
 | Double click, `R` | Reset the view |
-| Ctrl + click | Listen to the signal under the cursor (FM) |
-| Ctrl + drag | Slide the channel being listened to |
+| Ctrl + click *(Cmd + click on macOS)* | Listen to the signal under the cursor (FM) |
+| Ctrl + drag *(Cmd + drag on macOS)* | Slide the channel being listened to |
 | `L` | Sound on / off (it starts by scanning for signals) |
 | `S` | Scanning on / off |
 | `N` | Skip to the next signal (or control channel) while scanning |
 | `1` / `2` / `3` | 3D view / top view (2D waterfall) / front view (spectrum) |
-| `←` / `→` | Tune down / up by 1/20 of the span (Shift: 1/200, Ctrl: half the span) |
+| `←` / `→` | Tune down / up by 1/20 of the span (Shift: 1/200, Ctrl / Cmd: half the span) |
 | `↑` / `↓` | Gain up / down (Shift: 5 dB steps) |
 | `[` / `]` | Halve / double the FFT size |
 | `,` / `.` | Slower / faster waterfall |
@@ -613,7 +634,7 @@ scanner looks for signals itself:
 | `F`, `F11` | Full screen |
 | `H` | Show / hide the control panel |
 | `F1` | Help |
-| Ctrl + `Q` | Quit |
+| Ctrl + `Q` *(Cmd + `Q` on macOS)* | Quit |
 
 Hovering over the plot shows the frequency, level and age of the point under
 the cursor.

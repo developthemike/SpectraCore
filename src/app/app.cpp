@@ -34,6 +34,7 @@
 #include "ui/axes.hpp"
 #include "ui/ui.hpp"
 #include "util/log.hpp"
+#include "util/platform.hpp"
 #include "util/units.hpp"
 
 namespace spectro {
@@ -382,8 +383,10 @@ App::App(const Options& options)
 #ifdef GLFW_WAYLAND_APP_ID
     glfwWindowHintString(GLFW_WAYLAND_APP_ID, "spectrogram");
 #endif
+#ifndef __APPLE__
     glfwWindowHintString(GLFW_X11_CLASS_NAME, "spectrogram");
     glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "spectrogram");
+#endif
 
     GLFWmonitor* monitor = nullptr;
     int          width = options_.width, height = options_.height;
@@ -1439,7 +1442,8 @@ void App::update_cursor_readout()
 
 void App::handle_input()
 {
-    ImGuiIO& io = ImGui::GetIO();
+    ImGuiIO&   io          = ImGui::GetIO();
+    const bool primary_mod = primary_modifier_held(io.KeyCtrl, io.KeySuper);
 
     // ---- Mouse: choose a channel, orbit, pan, zoom ----
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
@@ -1448,8 +1452,8 @@ void App::handle_input()
         const bool pan_drag = ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f) ||
                               ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f) ||
                               (io.KeyShift && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f));
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && io.KeyCtrl && !io.KeyShift) {
-            // Ctrl + click: listen to the signal under the cursor.
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && primary_mod && !io.KeyShift) {
+            // Ctrl + click (Cmd + click on macOS): listen to the signal under the cursor.
             choosing_ = true;
             choose_channel_at(io.MousePos.x, io.MousePos.y, true);
         } else if (choosing_) {
@@ -1473,7 +1477,7 @@ void App::handle_input()
             camera_.zoom(io.MouseWheel);
             camera_untouched_ = false;
         }
-        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !io.KeyCtrl)
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !primary_mod)
             apply_view(preset_);
     }
 
@@ -1536,12 +1540,12 @@ void App::handle_input()
         toggle_fullscreen();
     if (pressed(ImGuiKey_Escape) && fullscreen_)
         toggle_fullscreen();
-    if (pressed(ImGuiKey_Q) && io.KeyCtrl)
+    if (pressed(ImGuiKey_Q) && primary_mod)
         request_quit();
 
-    // Tuning: arrow keys step by 1/20 of the span (Shift: 1/200, Ctrl: half the span).
+    // Tuning: arrow keys step by 1/20 of the span (Shift: 1/200, Ctrl/Cmd: half the span).
     const double span = pipeline_.source().sample_rate();
-    const double step = io.KeyCtrl ? span * 0.5 : io.KeyShift ? span / 200.0 : span / 20.0;
+    const double step = primary_mod ? span * 0.5 : io.KeyShift ? span / 200.0 : span / 20.0;
     if (pressed(ImGuiKey_LeftArrow, true))
         tune_to(pipeline_.source().frequency() - step);
     if (pressed(ImGuiKey_RightArrow, true))
@@ -2405,7 +2409,8 @@ void App::draw_panel()
         toggle_listening();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Play FM audio, narrowband or wideband (L).  It scans for signals\n"
-                          "above a threshold; Ctrl + click a signal in the plot to choose one.");
+                          "above a threshold; %s + click a signal in the plot to choose one.",
+                          primary_modifier_name());
 #endif
 
     ImGui::PopItemWidth();
@@ -2715,7 +2720,7 @@ void App::draw_listen_window()
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         if (audio_)
             ImGui::TextWrapped("%s", audio_->description().c_str());
-        ImGui::TextWrapped("Ctrl + click or drag in the plot to choose a signal");
+        ImGui::TextWrapped("%s + click or drag in the plot to choose a signal", primary_modifier_name());
         ImGui::PopStyleColor();
 
         ImGui::PopItemWidth();
@@ -3327,12 +3332,20 @@ void App::draw_help()
             {"Right / middle drag, Shift + drag", "Move the view"},
             {"Mouse wheel", "Zoom"},
             {"Double click, R", "Reset the view"},
+#if defined(__APPLE__)
+            {"Cmd + click or drag", "Listen to the signal under the cursor (FM)"},
+#else
             {"Ctrl + click or drag", "Listen to the signal under the cursor (FM)"},
+#endif
             {"L", "Audio on / off (scans for signals)"},
             {"S", "Scanning on / off"},
             {"N", "Skip to the next signal (or control channel) while scanning"},
             {"1 / 2 / 3", "3D view / top view (2D waterfall) / front view (spectrum)"},
+#if defined(__APPLE__)
+            {"Left / Right", "Tune down / up (Shift: fine, Cmd: half the span)"},
+#else
             {"Left / Right", "Tune down / up (Shift: fine, Ctrl: half the span)"},
+#endif
             {"Up / Down", "Gain up / down (Shift: 5 dB steps)"},
             {"[ / ]", "Halve / double the FFT size"},
             {", / .", "Slower / faster waterfall"},
@@ -3344,7 +3357,11 @@ void App::draw_help()
             {"P, F12", "Save a screenshot"},
             {"F, F11", "Full screen"},
             {"H", "Show / hide the control panel"},
+#if defined(__APPLE__)
+            {"Cmd + Q", "Quit"},
+#else
             {"Ctrl + Q", "Quit"},
+#endif
         };
         if (ImGui::BeginTable("help", 2, ImGuiTableFlags_SizingFixedFit)) {
             for (const auto& row : kHelp) {
