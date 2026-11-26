@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+            extra_flags: ""
+            check_headless_build: true
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+            extra_flags: "-DSPECTRO_WITH_MBELIB=ON -DSPECTRO_WITH_WHISPER=ON"
+            check_headless_build: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config clang \
+            libbladerf-dev librtlsdr-dev libfftw3-dev zlib1g-dev \
+            libvulkan-dev libglfw3-dev glslang-tools
+
+      - name: Configure and build
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPECTRO_WARNINGS_AS_ERRORS=ON \
+            -DSPECTRO_NATIVE_ARCH=OFF \
+            ${{ matrix.extra_flags }}
+          cmake --build build
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke test headless simulator
+        run: ./build/spectrogram --source sim --headless --duration 2
+
+      - name: Build and test headless-only configuration
+        if: matrix.check_headless_build
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -S . -B build-headless -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPECTRO_BUILD_GUI=OFF \
+            -DSPECTRO_WARNINGS_AS_ERRORS=ON \
+            -DSPECTRO_NATIVE_ARCH=OFF
+          cmake --build build-headless
+          ctest --test-dir build-headless --output-on-failure
+
+  macos:
+    name: macOS (${{ matrix.config }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config: default
+            extra_flags: ""
+            check_headless_build: true
+          - config: full-optional
+            extra_flags: "-DSPECTRO_WITH_MBELIB=ON -DSPECTRO_WITH_WHISPER=ON"
+            check_headless_build: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Homebrew dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install cmake ninja pkg-config \
+            fftw glfw glslang vulkan-loader vulkan-headers molten-vk \
+            libbladerf librtlsdr
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPECTRO_WARNINGS_AS_ERRORS=ON \
+            -DSPECTRO_NATIVE_ARCH=OFF \
+            ${{ matrix.extra_flags }}
+          cmake --build build
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke test headless simulator
+        run: ./build/spectrogram --source sim --headless --duration 2
+
+      - name: Build and test headless-only configuration
+        if: matrix.check_headless_build
+        run: |
+          cmake -S . -B build-headless -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPECTRO_BUILD_GUI=OFF \
+            -DSPECTRO_WARNINGS_AS_ERRORS=ON \
+            -DSPECTRO_NATIVE_ARCH=OFF
+          cmake --build build-headless
+          ctest --test-dir build-headless --output-on-failure

@@ -1,0 +1,9 @@
+# Build directories
+/build/
+/build-*/
+
+# Screenshots saved by the application
+/spectrogram-*.png
+
+# macOS Finder metadata
+.DS_Store
